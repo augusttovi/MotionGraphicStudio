@@ -1,0 +1,6 @@
+{
+  "summary":  "Plano de atualização definitiva do Motor de Renderização de Motion Graphics Universal (Design System MALA.SOMBRE), contemplando a substituição 100% literal da System Instruction e a sincronização do wrapper do prompt de roteiro com o limite unificado de 250 linhas totais, preservando a cascata de provedores de IA, duração dinâmica e exportação determinística de frames.",
+  "updatedAt":  "2026-10-31T02:44:14.847602283Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

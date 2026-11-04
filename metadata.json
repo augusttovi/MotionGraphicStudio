@@ -1,0 +1,6 @@
+{
+  "name": "Mala.Sombre Motion Studio",
+  "description": "Estúdio cinematográfico para geração de motion graphics determinísticos em HTML5 com a identidade visual gótica Mala.Sombre.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,72 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-display: "Oswald", sans-serif;
+  --font-sans: "Plus Jakarta Sans", sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+
+  --color-obsidian: #000000;
+  --color-studio-bg: #050507;
+  --color-studio-surface: #0d0914;
+  --color-studio-elevated: #140d1f;
+  --color-sombre-deep: #2a0033;
+  --color-sombre-violet: #8a2be2;
+  --color-sombre-violet-bright: #a34ff0;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    background-color: var(--color-studio-bg);
+    color: #f3eff8;
+    scroll-behavior: smooth;
+  }
+
+  /* Custom subtle range input for deterministic seek(t) timeline */
+  input[type="range"].sombre-scrubber {
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    cursor: pointer;
+  }
+
+  input[type="range"].sombre-scrubber::-webkit-slider-runnable-track {
+    height: 6px;
+    border-radius: 9999px;
+    background: rgba(138, 43, 226, 0.22);
+  }
+
+  input[type="range"].sombre-scrubber::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    margin-top: -5px;
+    height: 16px;
+    width: 16px;
+    border-radius: 9999px;
+    background: #8a2be2;
+    border: 2px solid #ffffff;
+    box-shadow: 0 0 12px rgba(138, 43, 226, 0.7);
+    transition: transform 150ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  input[type="range"].sombre-scrubber:hover::-webkit-slider-thumb {
+    transform: scale(1.15);
+  }
+
+  input[type="range"].sombre-scrubber::-moz-range-track {
+    height: 6px;
+    border-radius: 9999px;
+    background: rgba(138, 43, 226, 0.22);
+  }
+
+  input[type="range"].sombre-scrubber::-moz-range-thumb {
+    height: 16px;
+    width: 16px;
+    border-radius: 9999px;
+    background: #8a2be2;
+    border: 2px solid #ffffff;
+    box-shadow: 0 0 12px rgba(138, 43, 226, 0.7);
+    transition: transform 150ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+}
