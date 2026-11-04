@@ -1,0 +1,795 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script id="malasombre-raf-guard">
+(function() {
+  var origGetContext = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function(type, attrs) {
+    if (type === 'webgl' || type === 'webgl2' || type === 'experimental-webgl') {
+      attrs = Object.assign({}, attrs || {}, { preserveDrawingBuffer: true });
+    }
+    return origGetContext.call(this, type, attrs);
+  };
+  var prngState = 0x6d2b79f5;
+  window.__msResetDeterministicPrng = function(timeSec) {
+    var q = Math.round((isFinite(timeSec) ? Math.max(0, timeSec) : 0) * 1000);
+    prngState = (0x6d2b79f5 ^ Math.imul(q + 1, 0x85ebca6b)) >>> 0;
+  };
+  Math.random = function() {
+    prngState = (prngState + 0x6d2b79f5) >>> 0;
+    var z = prngState;
+    z = Math.imul(z ^ (z >>> 15), z | 1);
+    z ^= z + Math.imul(z ^ (z >>> 7), z | 61);
+    return ((z ^ (z >>> 14)) >>> 0) / 4294967296;
+  };
+  var origRAF = window.requestAnimationFrame.bind(window);
+  window.__msRawRAF = origRAF;
+  window.__msCapturingFrames = false;
+  window.__msAiRegisteredRAF = false;
+  window.__msFallbackDuration = 52.5;
+  window.requestAnimationFrame = function(cb) {
+    window.__msAiRegisteredRAF = true;
+    return origRAF(function(ts) {
+      if (window.__msCapturingFrames) {
+        window.requestAnimationFrame(cb);
+        return;
+      }
+      cb(ts);
+    });
+  };
+})();
+</script>
+    <meta charset="UTF-8">
+    <title>MALA.SOMBRE - A Engrenagem das Nações</title>
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,700&family=Plus+Jakarta+Sans:wght@400;600&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+    <script type="application/json" id="ms-director-blueprint">
+    {
+        "artDirection": "Documentário Editorial Cinematográfico",
+        "visualLanguage": "Ilustração vetorial arquitetônica com diagramas sistêmicos e tipografia cinética",
+        "informationHierarchy": "Kicker (14px) -> Título Hero (72px) -> Subtítulo (24px) -> Dados (Mono)",
+        "scenes": [
+            {"id": "intro", "start": 0, "end": 6, "label": "01 / 09 · FLUXO CIRCULAR"},
+            {"id": "pib", "start": 6, "end": 12, "label": "02 / 09 · PRODUTO INTERNO BRUTO"},
+            {"id": "consumo", "start": 12, "end": 18, "label": "03 / 09 · CONSUMO DAS FAMÍLIAS"},
+            {"id": "investimento", "start": 18, "end": 24, "label": "04 / 09 · INVESTIMENTO E INFRA"},
+            {"id": "governo", "start": 24, "end": 30, "label": "05 / 09 · ARRECADAÇÃO E GASTO"},
+            {"id": "inflacao", "start": 30, "end": 36, "label": "06 / 09 · INFLAÇÃO E PODER DE COMPRA"},
+            {"id": "juros", "start": 36, "end": 42, "label": "07 / 09 · TAXA SELIC E BANCO CENTRAL"},
+            {"id": "emprego", "start": 42, "end": 48, "label": "08 / 09 · GERAÇÃO DE EMPREGO"},
+            {"id": "exterior", "start": 48, "end": 52.5, "label": "09 / 09 · COMÉRCIO EXTERIOR"}
+        ],
+        "cameraChoreography": "Dolly-in contínuo com pans laterais e parallax em 3 camadas"
+    }
+    </script>
+    <style>
+        :root { --bg: #F4F1EA; --primary: #1A2F23; --accent: #C45B2D; --font-display: 'Fraunces', serif; --font-body: 'Plus Jakarta Sans', sans-serif; --font-mono: 'JetBrains Mono', monospace; }
+        * { box-sizing: border-box; }
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #111; display: flex; justify-content: center; align-items: center; }
+        #stage { position: relative; width: 1920px; height: 1080px; background: var(--bg); overflow: hidden; flex-shrink: 0; }
+        canvas, svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+        .ui-layer { position: absolute; inset: 0; pointer-events: none; z-index: 100; padding: 60px 80px; color: var(--primary); }
+        .header { display: flex; justify-content: space-between; border-bottom: 1px solid rgba(26,47,35,0.15); padding-bottom: 20px; }
+        .chapter { font-family: var(--font-mono); font-size: 14px; letter-spacing: 2px; text-transform: uppercase; font-weight: 500; }
+        .footer-note { position: absolute; bottom: 40px; left: 80px; font-family: var(--font-body); font-size: 13px; opacity: 0.5; font-weight: 400; }
+        #ui-title { font-family: var(--font-display); font-size: 76px; margin: 45px 0 10px 0; line-height: 1.1; letter-spacing: -1px; }
+        #ui-subtitle { font-family: var(--font-body); font-size: 22px; max-width: 650px; line-height: 1.5; opacity: 0.8; }
+    </style>
+</head>
+<body>
+
+<div id="stage">
+    <canvas id="bg-canvas" width="1920" height="1080"></canvas>
+    <svg id="main-svg" viewBox="0 0 1920 1080">
+        <defs>
+            <filter id="soft-shadow" x="-50%" y="-50%" width="200%" height="200%">
+                <feGaussianBlur in="SourceAlpha" stdDeviation="12" />
+                <feOffset dx="0" dy="15" />
+                <feComponentTransfer><feFuncA type="linear" slope="0.15"/></feComponentTransfer>
+                <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+            </filter>
+            
+            <symbol id="asset-bank" viewBox="0 0 200 160">
+                <path d="M10,150 L190,150 L190,140 L10,140 Z" fill="currentColor"/>
+                <path d="M25,140 L40,140 L40,65 L25,65 Z M70,140 L85,140 L85,65 L70,65 Z M115,140 L130,140 L130,65 L115,65 Z M160,140 L175,140 L175,65 L160,65 Z" fill="currentColor"/>
+                <path d="M10,65 L100,15 L190,65 Z" fill="currentColor"/>
+                <path d="M85,90 A15,15 0 1,1 115,90 A15,15 0 1,1 85,90" fill="var(--accent)" opacity="0.8"/>
+            </symbol>
+
+            <symbol id="asset-factory" viewBox="0 0 200 160">
+                <path d="M20,150 L180,150 L180,80 L140,45 L140,80 L100,45 L100,80 L60,45 L60,80 L20,80 Z" fill="currentColor"/>
+                <rect x="150" y="25" width="22" height="65" fill="currentColor"/>
+                <path d="M150,20 Q160,0 175,15 T190,5" fill="none" stroke="var(--primary)" stroke-width="3" opacity="0.3"/>
+            </symbol>
+
+            <symbol id="asset-house" viewBox="0 0 200 160">
+                <path d="M40,150 L160,150 L160,80 L100,30 L40,80 Z" fill="currentColor"/>
+                <rect x="85" y="110" width="30" height="40" fill="var(--bg)"/>
+                <rect x="65" y="90" width="20" height="20" fill="var(--bg)" opacity="0.5"/>
+                <rect x="115" y="90" width="20" height="20" fill="var(--bg)" opacity="0.5"/>
+            </symbol>
+
+            <symbol id="asset-ship" viewBox="0 0 240 160">
+                <path d="M20,100 L220,100 L195,140 L45,140 Z" fill="currentColor"/>
+                <rect x="60" y="65" width="35" height="35" fill="var(--accent)"/>
+                <rect x="100" y="65" width="35" height="35" fill="var(--primary)" opacity="0.7"/>
+                <rect x="140" y="50" width="35" height="50" fill="var(--accent)"/>
+                <path d="M20,145 Q120,155 220,145" fill="none" stroke="var(--primary)" stroke-width="2" opacity="0.4"/>
+            </symbol>
+
+            <clipPath id="text-reveal"><rect id="reveal-rect" x="0" y="0" width="1920" height="1000" /></clipPath>
+        </defs>
+
+        <g id="parallax-far" opacity="0.4"></g>
+        <g id="parallax-mid" opacity="0.7"></g>
+        <g id="main-content" filter="url(#soft-shadow)"></g>
+    </svg>
+
+    <div class="ui-layer">
+        <div class="header">
+            <div id="ui-chapter" class="chapter">01 / 09 · CARREGANDO</div>
+            <div class="chapter">MALA.SOMBRE · BROADCAST</div>
+        </div>
+        <div style="clip-path: url(#text-reveal);">
+            <h1 id="ui-title">A Engrenagem das Nações</h1>
+        </div>
+        <p id="ui-subtitle">Uma análise sistêmica sobre a circulação de riqueza e os motores da economia moderna.</p>
+        <div class="footer-note">Valores ilustrativos para fins didáticos · Projeção Estocástica · © 2024 MALA.SOMBRE Motion Studio</div>
+    </div>
+</div>
+
+<script>
+    window.DURATION = 52.5;
+    const canvas = document.getElementById('bg-canvas');
+    const ctx = canvas.getContext('2d');
+    const mainContent = document.getElementById('main-content');
+    const midLayer = document.getElementById('parallax-mid');
+    const farLayer = document.getElementById('parallax-far');
+    const uiChapter = document.getElementById('ui-chapter');
+    const uiTitle = document.getElementById('ui-title');
+    const uiSubtitle = document.getElementById('ui-subtitle');
+
+    const clamp01 = (t) => Math.min(1, Math.max(0, t));
+    const seg = (t, a, b) => clamp01((t - a) / (b - a));
+    const lerp = (a, b, t) => a + (b - a) * t;
+    const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+    const easeInOutCubic = (t) => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+    const hash01 = (s) => { const x = Math.sin(s * 12.9898 + 78.233) * 43758.5453; return x - Math.floor(x); };
+
+    const SCENES = JSON.parse(document.getElementById('ms-director-blueprint').textContent).scenes;
+
+    function drawGrid(t) {
+        ctx.clearRect(0, 0, 1920, 1080);
+        ctx.strokeStyle = 'rgba(26, 47, 35, 0.06)';
+        ctx.lineWidth = 1;
+        const speed = t * 40;
+        for(let x = -200; x < 1920 + 200; x += 120) {
+            ctx.beginPath(); ctx.moveTo(x - (speed % 120), 0); ctx.lineTo(x - (speed % 120), 1080); ctx.stroke();
+        }
+        for(let y = 0; y < 1080; y += 120) {
+            ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(1920, y); ctx.stroke();
+        }
+    }
+
+    function createNode(x, y, label, iconId, scale=1, opacity=1) {
+        return `
+            <g transform="translate(${x},${y}) scale(${scale})" style="opacity: ${opacity}">
+                <use href="#${iconId}" x="-100" y="-130" width="200" height="160" fill="var(--primary)"/>
+                <text y="60" text-anchor="middle" font-family="var(--font-mono)" font-size="15" fill="var(--primary)" font-weight="600" style="letter-spacing:1px">${label}</text>
+            </g>
+        `;
+    }
+
+    function drawBezierFlow(x1, y1, x2, y2, t, active=true, label="") {
+        const mx = (x1 + x2) / 2;
+        const my = Math.min(y1, y2) - 150;
+        const path = `M ${x1} ${y1} Q ${mx} ${my} ${x2} ${y2}`;
+        const dash = 20;
+        const gap = 15;
+        const offset = -(t * 120) % (dash + gap);
+        return `
+            <path d="${path}" fill="none" stroke="${active ? 'var(--accent)' : 'var(--primary)'}" 
+                stroke-width="${active ? 3 : 1}" stroke-dasharray="${dash},${gap}" 
+                stroke-dashoffset="${offset}" opacity="${active ? 0.8 : 0.2}" />
+            ${label ? `<text font-family="var(--font-mono)" font-size="12" fill="var(--accent)" opacity="0.8"><textPath href="#p${x1}${y1}" startOffset="50%">${label}</textPath></text>` : ''}
+        `;
+    }
+
+    window.seek = function(t) {
+        drawGrid(t);
+        const scene = SCENES.find(s => t >= s.start && t < s.end) || SCENES[SCENES.length-1];
+        const sceneIdx = SCENES.indexOf(scene);
+        const sceneProg = seg(t, scene.start, scene.end);
+        
+        uiChapter.innerText = scene.label;
+        
+        let camX = 960, camY = 540, camZoom = 1;
+        mainContent.innerHTML = '';
+        midLayer.innerHTML = '';
+        farLayer.innerHTML = '';
+
+        // Scene Logic
+        if (scene.id === 'intro') {
+            uiTitle.innerText = "O Fluxo Circular";
+            uiSubtitle.innerText = "A base da macroeconomia: famílias fornecem trabalho e consomem; empresas produzem e pagam salários.";
+            camZoom = lerp(1.1, 1.0, easeOutCubic(sceneProg));
+            let h = createNode(500, 600, "FAMÍLIAS", "asset-house", 0.9);
+            h += createNode(1420, 600, "EMPRESAS", "asset-factory", 0.9);
+            h += drawBezierFlow(600, 550, 1320, 550, t, true); // Trabalho
+            h += drawBezierFlow(1320, 650, 600, 650, -t, true); // Salários
+            mainContent.innerHTML = h;
+        }
+
+        else if (scene.id === 'pib') {
+            uiTitle.innerText = "Produto Interno Bruto";
+            uiSubtitle.innerText = "A soma de todos os bens e serviços finais produzidos. O termômetro da riqueza nacional.";
+            let h = `<g transform="translate(960, 750)">`;
+            for(let i=0; i<7; i++) {
+                const val = [40, 65, 90, 130, 110, 155, 190][i];
+                const grow = easeOutCubic(seg(sceneProg, i*0.1, i*0.1 + 0.4));
+                const barH = val * 2.5 * grow;
+                h += `<rect x="${(i-3.5)*140}" y="${-barH}" width="100" height="${barH}" fill="var(--primary)" opacity="${0.4 + i*0.1}"/>`;
+                h += `<text x="${(i-3)*140 - 70}" y="40" text-anchor="middle" font-family="var(--font-mono)" font-size="14">Q${i+1}</text>`;
+            }
+            h += `<text y="-550" text-anchor="middle" font-family="var(--font-display)" font-size="80" fill="var(--accent)">$ ${(lerp(0, 2.4, easeOutCubic(sceneProg))).toFixed(2)} TRI</text>`;
+            h += `</g>`;
+            mainContent.innerHTML = h;
+        }
+
+        else if (scene.id === 'consumo') {
+            uiTitle.innerText = "Consumo das Famílias";
+            uiSubtitle.innerText = "O maior componente do PIB. Quando as famílias gastam, a roda da economia gira mais rápido.";
+            camX = lerp(960, 1100, sceneProg);
+            let h = createNode(600, 600, "FAMÍLIAS", "asset-house", 1.2);
+            for(let i=0; i<5; i++) {
+                const p = seg(t + i*0.2, scene.start, scene.end);
+                h += `<circle cx="${lerp(700, 1600, p)}" cy="${600 + Math.sin(p*10)*30}" r="8" fill="var(--accent)" opacity="${1-p}"/>`;
+            }
+            mainContent.innerHTML = h;
+        }
+
+        else if (scene.id === 'investimento') {
+            uiTitle.innerText = "Investimento e Infra";
+            uiSubtitle.innerText = "Capital aplicado em máquinas, fábricas e logística para aumentar a capacidade produtiva futura.";
+            let h = createNode(960, 650, "SETOR PRODUTIVO", "asset-factory", 1.3);
+            const craneH = lerp(0, 200, easeOutCubic(sceneProg));
+            h += `<line x1="1100" y1="650" x2="1100" y2="${650-craneH}" stroke="var(--accent)" stroke-width="4" />`;
+            h += `<rect x="1050" y="${640-craneH}" width="100" height="10" fill="var(--accent)" />`;
+            mainContent.innerHTML = h;
+        }
+
+        else if (scene.id === 'governo') {
+            uiTitle.innerText = "O Papel do Estado";
+            uiSubtitle.innerText = "Arrecadação via impostos para prover serviços públicos, segurança e infraestrutura social.";
+            let h = createNode(960, 550, "TESOURO NACIONAL", "asset-bank", 1.2);
+            h += drawBezierFlow(400, 800, 860, 550, t, sceneProg > 0.2); // Impostos
+            h += drawBezierFlow(1060, 550, 1520, 800, t, sceneProg > 0.5); // Gasto
+            mainContent.innerHTML = h;
+        }
+
+        else if (scene.id === 'inflacao') {
+            uiTitle.innerText = "Poder de Compra";
+            uiSubtitle.innerText = "A inflação é o aumento generalizado de preços. Sem controle, ela corrói o salário real.";
+            const swing = Math.sin(t * 2) * 15;
+            let h = `<g transform="translate(960, 650) rotate(${swing})">
+                <line x1="-400" y1="0" x2="400" y2="0" stroke="var(--primary)" stroke-width="6"/>
+                <g transform="translate(-300, -60)">${createNode(0,0,"PREÇOS","asset-house", 0.6)}</g>
+                <g transform="translate(300, -60)">${createNode(0,0,"MOEDA","asset-bank", 0.6)}</g>
+            </g>`;
+            mainContent.innerHTML = h;
+        }
+
+        else if (scene.id === 'juros') {
+            uiTitle.innerText = "Taxa Selic";
+            uiSubtitle.innerText = "O Banco Central ajusta os juros para controlar a inflação e estimular ou esfriar a economia.";
+            const juros = lerp(13.75, 10.50, easeInOutCubic(sceneProg));
+            let h = `<text x="960" y="540" text-anchor="middle" font-family="var(--font-display)" font-size="120" fill="var(--primary)">${juros.toFixed(2)}%</text>`;
+            h += `<text x="960" y="620" text-anchor="middle" font-family="var(--font-mono)" font-size="20" fill="var(--accent)">META SELIC ANUAL</text>`;
+            mainContent.innerHTML = h;
+        }
+
+        else if (scene.id === 'emprego') {
+            uiTitle.innerText = "Geração de Emprego";
+            uiSubtitle.innerText = "O ciclo se fecha quando a produção demanda mão de obra, gerando renda e novo consumo.";
+            let h = '';
+            for(let i=0; i<12; i++) {
+                const x = 400 + (i % 6) * 220;
+                const y = 500 + Math.floor(i / 6) * 200;
+                const act = seg(sceneProg, i*0.05, i*0.05 + 0.2);
+                h += createNode(x, y, "POSTO ATIVO", "asset-house", 0.5 * act, act);
+            }
+            mainContent.innerHTML = h;
+        }
+
+        else if (scene.id === 'exterior') {
+            uiTitle.innerText = "Comércio Exterior";
+            uiSubtitle.innerText = "Exportações e Importações ligam o país ao mundo. O câmbio define nossa competitividade.";
+            camZoom = lerp(1.0, 0.85, sceneProg);
+            let h = createNode(960, 500, "MERCADO GLOBAL", "asset-ship", 1.4);
+            const shipX = lerp(-300, 2220, sceneProg);
+            h += `<use href="#asset-ship" x="${shipX}" y="750" width="300" height="200" fill="var(--accent)"/>`;
+            mainContent.innerHTML = h;
+        }
+
+        // Camera & Parallax
+        const camTransform = `translate(${960 - (camX-960)}, ${540 - (camY-540)}) scale(${camZoom})`;
+        mainContent.setAttribute('transform', camTransform);
+        
+        // Final UI Polish
+        const titleReveal = easeOutCubic(seg(t, scene.start, scene.start + 1));
+        document.getElementById('reveal-rect').setAttribute('y', lerp(100, 0, titleReveal));
+        uiTitle.style.opacity = titleReveal;
+        uiSubtitle.style.opacity = titleReveal;
+    };
+
+    function fitStage() {
+        const stage = document.getElementById('stage');
+        const scale = Math.min(window.innerWidth / 1920, window.innerHeight / 1080);
+        stage.style.transform = `scale(${scale})`;
+    }
+    window.addEventListener('resize', fitStage);
+    fitStage();
+    window.seek(0);
+</script>
+
+<style id="malasombre-frames-style">
+  #ms-download-frames-btn {
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    z-index: 99999;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 15px;
+    border-radius: 10px;
+    border: 1px solid rgba(138, 43, 226, 0.55);
+    background: rgba(13, 9, 20, 0.86);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    color: #f3eff8;
+    font-family: 'Oswald', system-ui, -apple-system, sans-serif;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    cursor: pointer;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.65), 0 0 16px rgba(138, 43, 226, 0.25);
+    transition: background 150ms ease, border-color 150ms ease, transform 150ms ease;
+    user-select: none;
+  }
+  #ms-download-frames-btn:hover:not(:disabled) {
+    background: #2a0033;
+    border-color: #8a2be2;
+  }
+  #ms-download-frames-btn:disabled {
+    cursor: wait;
+    opacity: 0.92;
+  }
+  #ms-download-frames-btn svg {
+    width: 15px;
+    height: 15px;
+    stroke: #a855f7;
+    flex-shrink: 0;
+  }
+</style>
+<button id="ms-download-frames-btn" type="button" title="Exportar sequência PNG a 60 FPS em .zip">
+  <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+    <polyline points="7 10 12 15 17 10"></polyline>
+    <line x1="12" y1="15" x2="12" y2="3"></line>
+  </svg>
+  <span id="ms-download-frames-label">Baixar Frames</span>
+</button>
+<script id="malasombre-frames-exporter">
+(function() {
+  var btn = document.getElementById('ms-download-frames-btn');
+  var labelEl = document.getElementById('ms-download-frames-label');
+  var isExporting = false;
+
+  function parsePositiveNumber(val) {
+    if (typeof val === 'number' && isFinite(val) && val > 0) return val;
+    if (typeof val === 'string') {
+      var parsed = parseFloat(val.replace(',', '.'));
+      if (isFinite(parsed) && parsed > 0) return parsed;
+    }
+    return null;
+  }
+
+  function resolveRawSeekFn() {
+    if (typeof window.__msOriginalSeek === 'function') return window.__msOriginalSeek;
+    if (typeof window.seek === 'function') return window.seek.bind(window);
+    try {
+      if (typeof seek === 'function') return seek;
+    } catch (_e) {}
+    return null;
+  }
+
+  function resolveDuration() {
+    var fromWin =
+      parsePositiveNumber(window.DURATION) ||
+      parsePositiveNumber(window.duration) ||
+      parsePositiveNumber(window.TOTAL_DURATION);
+    if (fromWin) {
+      window.DURATION = fromWin;
+      return fromWin;
+    }
+    try {
+      if (typeof DURATION !== 'undefined') {
+        var fromLexical = parsePositiveNumber(DURATION);
+        if (fromLexical) {
+          window.DURATION = fromLexical;
+          return fromLexical;
+        }
+      }
+    } catch (_e) {}
+    var fb = parsePositiveNumber(window.__msFallbackDuration) || 10;
+    window.DURATION = fb;
+    return fb;
+  }
+
+  function installDeterministicSeekWrapper() {
+    var raw = resolveRawSeekFn();
+    if (!raw || window.__msSeekWrapped) return;
+    window.__msOriginalSeek = raw;
+    window.__msSeekWrapped = true;
+    window.seek = function(t) {
+      var dur = resolveDuration();
+      var numT = typeof t === 'number' && isFinite(t) ? t : 0;
+      var clampedT = Math.max(0, Math.min(dur, numT));
+      if (typeof window.__msResetDeterministicPrng === 'function') {
+        window.__msResetDeterministicPrng(clampedT);
+      }
+      return raw(clampedT);
+    };
+  }
+
+  function resolveSeekFn() {
+    installDeterministicSeekWrapper();
+    if (typeof window.seek === 'function') return window.seek.bind(window);
+    return resolveRawSeekFn();
+  }
+
+  function initStandaloneAndDuration() {
+    var dur = resolveDuration();
+    installDeterministicSeekWrapper();
+    var seekFn = resolveSeekFn();
+    if (!window.__msStudioControlled && !window.__msAiRegisteredRAF && seekFn) {
+      var lastTs = null;
+      var currentT = 0;
+      function standaloneLoop(ts) {
+        if (!window.__msCapturingFrames && !window.__msStudioControlled) {
+          dur = resolveDuration();
+          if (lastTs === null) lastTs = ts;
+          var dt = Math.min(0.1, Math.max(0, (ts - lastTs) / 1000));
+          lastTs = ts;
+          currentT = (currentT + dt) % dur;
+          try {
+            seekFn(currentT);
+          } catch (_err) {}
+        } else {
+          lastTs = ts;
+        }
+        window.__msRawRAF(standaloneLoop);
+      }
+      window.__msRawRAF(standaloneLoop);
+    }
+  }
+
+  if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    setTimeout(initStandaloneAndDuration, 0);
+  } else {
+    window.addEventListener('DOMContentLoaded', initStandaloneAndDuration);
+  }
+
+  function notifyParent(payload) {
+    if (window.parent && window.parent !== window) {
+      window.parent.postMessage(payload, '*');
+    }
+  }
+
+  function canvasToPngBlob(canvas) {
+    return new Promise(function(resolve, reject) {
+      canvas.toBlob(function(blob) {
+        if (blob) resolve(blob);
+        else reject(new Error('Falha ao capturar frame do Canvas.'));
+      }, 'image/png');
+    });
+  }
+
+  function drawSvgStringToCtx(svgMarkup, ctx, w, h) {
+    return new Promise(function(resolve) {
+      var svgBlob = new Blob([svgMarkup], { type: 'image/svg+xml;charset=utf-8' });
+      var url = URL.createObjectURL(svgBlob);
+      var img = new Image();
+      img.onload = function() {
+        try {
+          ctx.drawImage(img, 0, 0, w, h);
+        } catch (_err) {}
+        URL.revokeObjectURL(url);
+        resolve(true);
+      };
+      img.onerror = function() {
+        URL.revokeObjectURL(url);
+        resolve(false);
+      };
+      img.src = url;
+    });
+  }
+
+  function serializeStageSvg(svgEl, w, h) {
+    var clone = svgEl.cloneNode(true);
+    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    if (!clone.getAttribute('viewBox')) {
+      clone.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+    }
+    clone.setAttribute('width', String(w));
+    clone.setAttribute('height', String(h));
+    return new XMLSerializer().serializeToString(clone);
+  }
+
+  function copyComputedStylesDeep(srcNode, dstNode) {
+    if (srcNode.nodeType !== 1 || dstNode.nodeType !== 1) return;
+    var cs = window.getComputedStyle(srcNode);
+    var cssText = '';
+    for (var i = 0; i < cs.length; i++) {
+      var prop = cs[i];
+      var val = cs.getPropertyValue(prop);
+      if (val && val.indexOf('url("http') === -1 && val.indexOf("url('http") === -1) {
+        cssText += prop + ':' + val + ';';
+      }
+    }
+    dstNode.setAttribute('style', cssText);
+    var srcChildren = srcNode.children;
+    var dstChildren = dstNode.children;
+    for (var j = 0; j < srcChildren.length && j < dstChildren.length; j++) {
+      copyComputedStylesDeep(srcChildren[j], dstChildren[j]);
+    }
+  }
+
+  function serializeDomStageToSvg(w, h, transparentRootBg) {
+    var rootCandidate = document.getElementById('stage') || document.body;
+    var clone = rootCandidate.cloneNode(true);
+    copyComputedStylesDeep(rootCandidate, clone);
+    var btnClone = clone.querySelector ? clone.querySelector('#ms-download-frames-btn') : null;
+    if (btnClone && btnClone.parentNode) {
+      btnClone.parentNode.removeChild(btnClone);
+    }
+    var canvasesInClone = clone.querySelectorAll ? clone.querySelectorAll('canvas') : [];
+    for (var c = 0; c < canvasesInClone.length; c++) {
+      if (canvasesInClone[c].parentNode) {
+        canvasesInClone[c].parentNode.removeChild(canvasesInClone[c]);
+      }
+    }
+    var scripts = clone.querySelectorAll ? clone.querySelectorAll('script, link') : [];
+    for (var k = 0; k < scripts.length; k++) {
+      if (scripts[k].parentNode) scripts[k].parentNode.removeChild(scripts[k]);
+    }
+    clone.style.transform = 'none';
+    clone.style.width = w + 'px';
+    clone.style.height = h + 'px';
+    clone.style.margin = '0';
+    if (transparentRootBg) {
+      clone.style.background = 'transparent';
+      clone.style.backgroundColor = 'transparent';
+    }
+    var xhtml = new XMLSerializer().serializeToString(clone);
+    var bg = window.getComputedStyle(document.body).backgroundColor || '#000000';
+    var bgRect = transparentRootBg
+      ? ''
+      : '<rect width="100%" height="100%" fill="' + bg + '"/>';
+    return '<svg xmlns="http://www.w3.org/2000/svg" width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '">' +
+      bgRect +
+      '<foreignObject width="100%" height="100%">' + xhtml + '</foreignObject>' +
+      '</svg>';
+  }
+
+  function detectRichDomOverlays(allCanvases, allSvgs) {
+    var root = document.getElementById('stage') || document.body;
+    var children = root.querySelectorAll('*');
+    for (var i = 0; i < children.length; i++) {
+      var el = children[i];
+      if (btn && (el === btn || btn.contains(el))) continue;
+      var tag = el.tagName ? el.tagName.toLowerCase() : '';
+      if (tag === 'script' || tag === 'style' || tag === 'link' || tag === 'defs') continue;
+      if (allCanvases.indexOf(el) !== -1) continue;
+      if (allSvgs.length === 1 && (el === allSvgs[0] || allSvgs[0].contains(el))) continue;
+      if (el.id === 'stage' && (allCanvases.length === 1 || allSvgs.length === 1) && root.children.length === 1) continue;
+      var cs = window.getComputedStyle(el);
+      if (cs.display !== 'none' && cs.visibility !== 'hidden') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async function exportAllFrames() {
+    if (isExporting) return;
+
+    if (typeof window.JSZip !== 'function') {
+      labelEl.textContent = 'Erro: JSZip indisponível';
+      notifyParent({
+        type: 'MALASOMBRE_EXPORT_STATUS',
+        active: false,
+        error: 'Biblioteca JSZip via CDN não pôde ser carregada.'
+      });
+      setTimeout(function() { labelEl.textContent = 'Baixar Frames'; }, 3000);
+      return;
+    }
+
+    var seekFn = resolveSeekFn();
+    if (!seekFn) {
+      labelEl.textContent = 'seek(t) ausente';
+      notifyParent({
+        type: 'MALASOMBRE_EXPORT_STATUS',
+        active: false,
+        error: 'Função determinística window.seek(t) não encontrada na cena.'
+      });
+      setTimeout(function() { labelEl.textContent = 'Baixar Frames'; }, 3000);
+      return;
+    }
+
+    var allCanvases = Array.prototype.slice.call(document.querySelectorAll('canvas'));
+    var allSvgs = Array.prototype.slice.call(document.querySelectorAll('svg')).filter(function(el) {
+      return !btn.contains(el);
+    });
+
+    allCanvases.sort(function(a, b) {
+      var za = parseInt(window.getComputedStyle(a).zIndex, 10) || 0;
+      var zb = parseInt(window.getComputedStyle(b).zIndex, 10) || 0;
+      return za - zb;
+    });
+
+    var frameW = (allCanvases[0] && allCanvases[0].width >= 1280 && allCanvases[0].width) || 1920;
+    var frameH = (allCanvases[0] && allCanvases[0].height >= 720 && allCanvases[0].height) || 1080;
+    var hasDomOverlays = detectRichDomOverlays(allCanvases, allSvgs);
+    var isPureSingleCanvas = allCanvases.length === 1 && allSvgs.length === 0 && !hasDomOverlays;
+    var isPureSingleSvg = allCanvases.length === 0 && allSvgs.length === 1 && !hasDomOverlays;
+    var needsComposite = !isPureSingleCanvas;
+
+    var compositeCanvas = null;
+    var compositeCtx = null;
+    if (needsComposite) {
+      compositeCanvas = document.createElement('canvas');
+      compositeCanvas.width = frameW;
+      compositeCanvas.height = frameH;
+      compositeCtx = compositeCanvas.getContext('2d');
+    }
+
+    isExporting = true;
+    window.__msCapturingFrames = true;
+    btn.disabled = true;
+
+    try {
+      if (document.fonts && document.fonts.ready) {
+        await document.fonts.ready;
+      }
+
+      var duration = resolveDuration();
+      var fps = 60;
+      var step = 1 / fps;
+      var totalSteps = Math.ceil(duration * fps - 1e-9);
+      var totalFrames = totalSteps + 1;
+      var zip = new window.JSZip();
+
+      for (var i = 0; i <= totalSteps; i++) {
+        var t = Math.min(duration, i * step);
+        seekFn(t);
+
+        var targetCanvas = allCanvases[0];
+        if (compositeCanvas && compositeCtx) {
+          var bodyBg = window.getComputedStyle(document.body).backgroundColor;
+          compositeCtx.clearRect(0, 0, frameW, frameH);
+          if (bodyBg && bodyBg !== 'rgba(0, 0, 0, 0)' && bodyBg !== 'transparent') {
+            compositeCtx.fillStyle = bodyBg;
+            compositeCtx.fillRect(0, 0, frameW, frameH);
+          }
+
+          if (isPureSingleSvg) {
+            var fullSvgStr = serializeStageSvg(allSvgs[0], frameW, frameH);
+            await drawSvgStringToCtx(fullSvgStr, compositeCtx, frameW, frameH);
+          } else {
+            for (var cIdx = 0; cIdx < allCanvases.length; cIdx++) {
+              var layer = allCanvases[cIdx];
+              if (layer.width > 0 && layer.height > 0 && window.getComputedStyle(layer).display !== 'none') {
+                compositeCtx.drawImage(layer, 0, 0, frameW, frameH);
+              }
+            }
+            var domSvg = serializeDomStageToSvg(frameW, frameH, allCanvases.length > 0);
+            await drawSvgStringToCtx(domSvg, compositeCtx, frameW, frameH);
+          }
+          targetCanvas = compositeCanvas;
+        }
+
+        var frameBlob = await canvasToPngBlob(targetCanvas);
+        var frameName = 'frame_' + String(i).padStart(5, '0') + '.png';
+        zip.file(frameName, frameBlob, { compression: 'STORE' });
+
+        if (i % 5 === 0 || i === totalSteps) {
+          var pct = Math.round(((i + 1) / totalFrames) * 100);
+          labelEl.textContent = 'Capturando ' + (i + 1) + '/' + totalFrames + ' (' + pct + '%)';
+          notifyParent({
+            type: 'MALASOMBRE_EXPORT_STATUS',
+            active: true,
+            phase: 'capturing',
+            current: i + 1,
+            total: totalFrames,
+            percent: pct
+          });
+          await new Promise(function(r) { setTimeout(r, 0); });
+        }
+      }
+
+      labelEl.textContent = 'Compactando .zip...';
+      notifyParent({
+        type: 'MALASOMBRE_EXPORT_STATUS',
+        active: true,
+        phase: 'zipping',
+        current: totalFrames,
+        total: totalFrames,
+        percent: 100
+      });
+
+      var zipBlob = await zip.generateAsync({
+        type: 'blob',
+        compression: 'STORE'
+      });
+
+      if (window.__msParentHandlesDownload && window.parent && window.parent !== window) {
+        notifyParent({
+          type: 'MALASOMBRE_ZIP_READY',
+          blob: zipBlob,
+          filename: 'mala-sombre-frames-60fps.zip'
+        });
+      } else {
+        var downloadUrl = URL.createObjectURL(zipBlob);
+        var anchor = document.createElement('a');
+        anchor.href = downloadUrl;
+        anchor.download = 'mala-sombre-frames-60fps.zip';
+        document.body.appendChild(anchor);
+        anchor.click();
+        document.body.removeChild(anchor);
+        setTimeout(function() { URL.revokeObjectURL(downloadUrl); }, 10000);
+      }
+
+      labelEl.textContent = 'Frames Baixados';
+      notifyParent({
+        type: 'MALASOMBRE_EXPORT_STATUS',
+        active: false,
+        phase: 'done',
+        current: totalFrames,
+        total: totalFrames,
+        percent: 100
+      });
+      setTimeout(function() {
+        if (!isExporting) labelEl.textContent = 'Baixar Frames';
+      }, 2200);
+    } catch (err) {
+      console.error('Erro ao exportar frames:', err);
+      labelEl.textContent = 'Erro na Captura';
+      notifyParent({
+        type: 'MALASOMBRE_EXPORT_STATUS',
+        active: false,
+        error: err && err.message ? err.message : 'Erro ao exportar frames.'
+      });
+      setTimeout(function() {
+        if (!isExporting) labelEl.textContent = 'Baixar Frames';
+      }, 3000);
+    } finally {
+      window.__msCapturingFrames = false;
+      isExporting = false;
+      btn.disabled = false;
+    }
+  }
+
+  btn.addEventListener('click', exportAllFrames);
+
+  window.addEventListener('message', function(event) {
+    if (event.data && event.data.type === 'MALASOMBRE_CMD_EXPORT_FRAMES') {
+      exportAllFrames();
+    }
+  });
+})();
+</script>
+</body>
+</html>

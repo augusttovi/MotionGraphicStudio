@@ -178,7 +178,9 @@ export function StoryboardWorkspace({
       presentElements: ["Elemento focal", "Tipografia de apoio"],
       layoutAndHierarchy: "Elemento principal centralizado dentro da área segura 1920×1080.",
       onScreenText: "",
-      motionAndAnimation: "Entrada suave com ease-out quintic seguida de pausa para leitura.",
+      motionAndAnimation: "Entrada por máscara tipográfica com ease-out quintic e construção vetorial progressiva.",
+      cameraMovement: "Dolly-in suave em direção ao ponto focal com parallax sutil.",
+      visualLayering: "Fundo atmosférico (0.25x), diagrama vetorial composto (0.65x) e tipografia em primeiro plano (1.0x).",
       entryTransition: lastScene
         ? `Continuidade a partir de "${lastScene.title}"`
         : "Abertura suave",
@@ -735,9 +737,14 @@ export function StoryboardWorkspace({
                   </div>
 
                   <div className="space-y-1">
-                    <span className="text-xs text-[#84749c] block">Movimento, Animação & Hierarquia</span>
+                    <span className="text-xs text-[#84749c] block">Movimento, Câmera & Hierarquia</span>
                     <p className="text-[#b3a5c7] leading-relaxed">{scene.motionAndAnimation}</p>
-                    <p className="text-xs text-[#8f7fa8] pt-1">
+                    {scene.cameraMovement && (
+                      <p className="text-xs text-[#c59cff] pt-0.5">
+                        Câmera: {scene.cameraMovement}
+                      </p>
+                    )}
+                    <p className="text-xs text-[#8f7fa8] pt-0.5">
                       Composição: {scene.layoutAndHierarchy}
                     </p>
                   </div>
@@ -945,6 +952,25 @@ export function StoryboardWorkspace({
                           e.target.value
                         )
                       }
+                      className="w-full rounded-lg bg-[#140d1f] border border-[#8a2be2]/35 px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-[#8a2be2]"
+                    />
+                  </div>
+
+                  <div className="space-y-1 sm:col-span-2">
+                    <label className="block text-xs font-medium text-[#c5b8d8]">
+                      Coreografia de Câmera Virtual
+                    </label>
+                    <input
+                      type="text"
+                      value={scene.cameraMovement ?? ""}
+                      onChange={(e) =>
+                        handleUpdateSceneField(
+                          scene.id,
+                          "cameraMovement",
+                          e.target.value
+                        )
+                      }
+                      placeholder="Ex: Dolly-in suave com camera tracking seguindo o fluxo circular..."
                       className="w-full rounded-lg bg-[#140d1f] border border-[#8a2be2]/35 px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-[#8a2be2]"
                     />
                   </div>

@@ -37,20 +37,20 @@ export const NVIDIA_CHAT_ENDPOINT =
   "https://integrate.api.nvidia.com/v1/chat/completions";
 
 /**
- * Orçamentos padrão coordenados para caber confortavelmente nos limites reais de proxy HTTP,
- * combinados com streaming SSE contínuo até o navegador:
- * - Gemini: 45s (inatividade máx 20s)
- * - OpenRouter: 38s (inatividade máx 18s)
- * - NVIDIA NIM: 38s (inatividade máx 18s)
- * - Teto global previsível da cascata inteira: 95s (CASCADE_TOTAL_BUDGET_MS)
+ * Orçamentos padrão coordenados para suportar animações documentais ricas (45–60s, múltiplas cenas e vetores detalhados)
+ * combinados com streaming SSE contínuo até o navegador e detecção rápida de inatividade (18–20s):
+ * - Gemini: 75s (inatividade máx 20s + fallback imediato por modelo em 429/lentidão)
+ * - OpenRouter: 95s para streams de conteúdo ativos (inatividade máx 18s)
+ * - NVIDIA NIM: 95s para streams de conteúdo ativos (inatividade máx 18s)
+ * - Teto global previsível da cascata inteira: 210s (CASCADE_TOTAL_BUDGET_MS)
  */
-export const DEFAULT_GEMINI_TIMEOUT_MS = 45_000;
-export const DEFAULT_OPENROUTER_TIMEOUT_MS = 38_000;
-export const DEFAULT_NVIDIA_TIMEOUT_MS = 38_000;
-export const DEFAULT_CASCADE_TOTAL_BUDGET_MS = 95_000;
+export const DEFAULT_GEMINI_TIMEOUT_MS = 75_000;
+export const DEFAULT_OPENROUTER_TIMEOUT_MS = 95_000;
+export const DEFAULT_NVIDIA_TIMEOUT_MS = 95_000;
+export const DEFAULT_CASCADE_TOTAL_BUDGET_MS = 210_000;
 
 const MIN_TIMEOUT_MS = 50;
-const MAX_TIMEOUT_MS = 150_000;
+const MAX_TIMEOUT_MS = 220_000;
 const MIN_REMAINING_BUDGET_TO_START_MS = 1_200;
 const PROGRESS_THROTTLE_MS = 750;
 
@@ -804,47 +804,83 @@ async function callGeminiStreaming(options: {
 
   const runStreamForModel = async (targetModel: string): Promise<string> => {
     const isGemini3 = targetModel.startsWith("gemini-3");
-    const stream = await ai.models.generateContentStream({
-      model: targetModel,
-      contents: userPrompt,
-      config: {
-        systemInstruction,
-        maxOutputTokens,
-        temperature: 0.4,
-        ...(mode === "json" && geminiSchema
-          ? {
-              responseMimeType: "application/json",
-              responseSchema: geminiSchema,
-            }
-          : {}),
-        ...(isGemini3
-          ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-          : {}),
-        abortSignal: signal,
-      },
-    });
-
-    notifyActivity();
-    const chunks: string[] = [];
-    let totalChars = 0;
-    for await (const chunk of stream) {
-      if (signal.aborted || isSettled()) {
-        throw new Error("AbortError: stream aborted");
-      }
-      notifyActivity();
-      if (chunk.text) {
-        chunks.push(chunk.text);
-        totalChars += chunk.text.length;
-        onChunkProgress?.(totalChars, targetModel);
-      }
+    const isGemini25 = targetModel.startsWith("gemini-2.5");
+    const modelAc = new AbortController();
+    const onParentAbort = () => modelAc.abort();
+    if (signal.aborted) {
+      throw new Error("AbortError: stream aborted");
     }
-    return chunks.join("");
+    signal.addEventListener("abort", onParentAbort, { once: true });
+
+    let gotFirstChunk = false;
+    const firstChunkTimer = setTimeout(() => {
+      if (!gotFirstChunk && !modelAc.signal.aborted) {
+        modelAc.abort(new Error("FIRST_CHUNK_TIMEOUT"));
+      }
+    }, 12_000);
+
+    try {
+      const stream = await ai.models.generateContentStream({
+        model: targetModel,
+        contents: userPrompt,
+        config: {
+          systemInstruction,
+          maxOutputTokens,
+          temperature: 0.4,
+          ...(mode === "json" && geminiSchema
+            ? {
+                responseMimeType: "application/json",
+                responseSchema: geminiSchema,
+              }
+            : {}),
+          ...(isGemini3
+            ? { thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL } }
+            : isGemini25
+              ? { thinkingConfig: { thinkingBudget: 0 } }
+              : {}),
+          abortSignal: modelAc.signal,
+        },
+      });
+
+      notifyActivity();
+      const chunks: string[] = [];
+      let totalChars = 0;
+      for await (const chunk of stream) {
+        if (signal.aborted || isSettled()) {
+          throw new Error("AbortError: stream aborted");
+        }
+        if (chunk.text) {
+          if (!gotFirstChunk) {
+            gotFirstChunk = true;
+            clearTimeout(firstChunkTimer);
+          }
+          notifyActivity();
+          chunks.push(chunk.text);
+          totalChars += chunk.text.length;
+          onChunkProgress?.(totalChars, targetModel);
+        }
+      }
+      if (!gotFirstChunk && modelAc.signal.aborted && !signal.aborted) {
+        throw new Error("FIRST_CHUNK_TIMEOUT");
+      }
+      return chunks.join("");
+    } catch (e) {
+      if (!gotFirstChunk && modelAc.signal.aborted && !signal.aborted) {
+        throw new Error("FIRST_CHUNK_TIMEOUT");
+      }
+      throw e;
+    } finally {
+      clearTimeout(firstChunkTimer);
+      signal.removeEventListener("abort", onParentAbort);
+    }
   };
 
   const fallbackModels = [
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash",
     FALLBACK_GEMINI_LITE_MODEL,
     FALLBACK_GEMINI_MODEL,
-  ].filter((m) => m !== model);
+  ].filter((m, pos, arr) => m !== model && arr.indexOf(m) === pos);
 
   let lastErr: unknown = null;
   const candidateChain = [model, ...fallbackModels];
@@ -865,6 +901,10 @@ async function callGeminiStreaming(options: {
         msg.includes("404") ||
         msg.includes("not supported") ||
         msg.includes("503") ||
+        msg.includes("429") ||
+        msg.includes("quota") ||
+        msg.includes("resource_exhausted") ||
+        msg.includes("first_chunk_timeout") ||
         msg.includes("unavailable") ||
         msg.includes("high demand") ||
         msg.includes("overloaded");
@@ -880,7 +920,7 @@ async function callGeminiStreaming(options: {
         onChunkProgress?.(
           0,
           nextModel,
-          `Modelo ${candidateModel} sob alta demanda. Alternando para ${nextModel}...`
+          `Alternando automaticamente para ${nextModel}...`
         );
         continue;
       }
@@ -931,7 +971,7 @@ async function callOpenAICompatibleStreaming(options: {
     const payload: Record<string, unknown> = {
       model,
       stream: true,
-      max_tokens: maxTokens,
+      max_tokens: Math.min(maxTokens, 16384),
       temperature: 0.4,
       messages: [
         { role: "system", content: systemInstruction },
@@ -1028,6 +1068,7 @@ async function callOpenAICompatibleStreaming(options: {
   let resolvedModel = model;
   const contentParts: string[] = [];
   let totalChars = 0;
+  const streamOpenedMs = Date.now();
 
   try {
     while (true) {
@@ -1037,7 +1078,16 @@ async function callOpenAICompatibleStreaming(options: {
       }
       const { done, value } = await reader.read();
       if (done) break;
-      notifyActivity();
+      if (totalChars > 0 || Date.now() - streamOpenedMs < 20_000) {
+        notifyActivity();
+      } else {
+        await reader.cancel().catch(() => {});
+        throw new ProviderCallError(
+          `${providerLabel} (${resolvedModel}) não emitiu conteúdo útil após 20s.`,
+          "timeout",
+          504
+        );
+      }
       buffer += decoder.decode(value, { stream: true });
 
       let newlineIdx = buffer.indexOf("\n");
@@ -1073,6 +1123,7 @@ async function callOpenAICompatibleStreaming(options: {
             parsed.choices?.[0]?.delta?.content ??
             parsed.choices?.[0]?.message?.content;
           if (typeof piece === "string" && piece.length > 0) {
+            notifyActivity();
             contentParts.push(piece);
             totalChars += piece.length;
             onChunkProgress?.(totalChars, resolvedModel);

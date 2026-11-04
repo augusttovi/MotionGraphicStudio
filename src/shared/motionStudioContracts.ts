@@ -127,6 +127,8 @@ export interface StoryboardScene {
   layoutAndHierarchy: string;
   onScreenText: string;
   motionAndAnimation: string;
+  cameraMovement?: string;
+  visualLayering?: string;
   entryTransition: string;
   exitTransition: string;
   continuityNotes: string;
@@ -238,6 +240,43 @@ export interface StreamProgressEvent<TResult = unknown> {
   errorPayload?: ApiErrorPayload;
 }
 
+// Auditoria Objetiva e Verificável de Qualidade Visual e Técnica (sem pontuações subjetivas inventadas)
+export interface MotionQualityCriterionCheck {
+  id:
+    | "determinism_and_clamping"
+    | "duration_and_scene_progression"
+    | "illustration_and_vector_craft"
+    | "composition_and_depth_layers"
+    | "typographic_hierarchy"
+    | "data_and_diagram_rigor"
+    | "camera_choreography"
+    | "transition_sophistication"
+    | "motion_variety_and_easing"
+    | "creative_blueprint_coherence";
+  label: string;
+  passed: boolean;
+  evidence: string;
+}
+
+export interface MotionQualityAuditReport {
+  passed: boolean;
+  refinementApplied: boolean;
+  criteria: MotionQualityCriterionCheck[];
+  deficienciesFixedOrRemaining: string[];
+  metrics: {
+    declaredDurationSeconds: number | null;
+    detectedScenesOrChapters: number;
+    vectorPathsCount: number;
+    curvedVectorCommandsCount: number;
+    distinctFontSizesCount: number;
+    hasDirectorBlueprint: boolean;
+    hasCameraRig: boolean;
+    hasMaskOrPathTransitions: boolean;
+    hasTabularNumerals: boolean;
+    isDeterministicSeek: boolean;
+  };
+}
+
 // Contratos de Requisição e Resposta HTTP
 export interface DirectGenerateRequest {
   script: string;
@@ -252,6 +291,7 @@ export interface DirectGenerateResponse {
     selectedStyleIds: StyleId[];
     renderTechnology: RenderTechnology;
     diagnostics?: ExecutionDiagnosticsSummary;
+    qualityAudit?: MotionQualityAuditReport;
   };
 }
 
@@ -288,6 +328,7 @@ export interface RenderStoryboardResponse {
   html: string;
   totalDuration: number;
   diagnostics?: ExecutionDiagnosticsSummary;
+  qualityAudit?: MotionQualityAuditReport;
 }
 
 /**

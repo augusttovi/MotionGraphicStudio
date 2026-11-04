@@ -81,6 +81,18 @@ export function injectFrameExporter(
     }
     return origGetContext.call(this, type, attrs);
   };
+  var prngState = 0x6d2b79f5;
+  window.__msResetDeterministicPrng = function(timeSec) {
+    var q = Math.round((isFinite(timeSec) ? Math.max(0, timeSec) : 0) * 1000);
+    prngState = (0x6d2b79f5 ^ Math.imul(q + 1, 0x85ebca6b)) >>> 0;
+  };
+  Math.random = function() {
+    prngState = (prngState + 0x6d2b79f5) >>> 0;
+    var z = prngState;
+    z = Math.imul(z ^ (z >>> 15), z | 1);
+    z ^= z + Math.imul(z ^ (z >>> 7), z | 61);
+    return ((z ^ (z >>> 14)) >>> 0) / 4294967296;
+  };
   var origRAF = window.requestAnimationFrame.bind(window);
   window.__msRawRAF = origRAF;
   window.__msCapturingFrames = false;
@@ -164,7 +176,8 @@ export function injectFrameExporter(
     return null;
   }
 
-  function resolveSeekFn() {
+  function resolveRawSeekFn() {
+    if (typeof window.__msOriginalSeek === 'function') return window.__msOriginalSeek;
     if (typeof window.seek === 'function') return window.seek.bind(window);
     try {
       if (typeof seek === 'function') return seek;
@@ -195,8 +208,31 @@ export function injectFrameExporter(
     return fb;
   }
 
+  function installDeterministicSeekWrapper() {
+    var raw = resolveRawSeekFn();
+    if (!raw || window.__msSeekWrapped) return;
+    window.__msOriginalSeek = raw;
+    window.__msSeekWrapped = true;
+    window.seek = function(t) {
+      var dur = resolveDuration();
+      var numT = typeof t === 'number' && isFinite(t) ? t : 0;
+      var clampedT = Math.max(0, Math.min(dur, numT));
+      if (typeof window.__msResetDeterministicPrng === 'function') {
+        window.__msResetDeterministicPrng(clampedT);
+      }
+      return raw(clampedT);
+    };
+  }
+
+  function resolveSeekFn() {
+    installDeterministicSeekWrapper();
+    if (typeof window.seek === 'function') return window.seek.bind(window);
+    return resolveRawSeekFn();
+  }
+
   function initStandaloneAndDuration() {
     var dur = resolveDuration();
+    installDeterministicSeekWrapper();
     var seekFn = resolveSeekFn();
     if (!window.__msStudioControlled && !window.__msAiRegisteredRAF && seekFn) {
       var lastTs = null;
@@ -291,13 +327,19 @@ export function injectFrameExporter(
     }
   }
 
-  function serializeDomStageToSvg(w, h) {
+  function serializeDomStageToSvg(w, h, transparentRootBg) {
     var rootCandidate = document.getElementById('stage') || document.body;
     var clone = rootCandidate.cloneNode(true);
     copyComputedStylesDeep(rootCandidate, clone);
     var btnClone = clone.querySelector ? clone.querySelector('#ms-download-frames-btn') : null;
     if (btnClone && btnClone.parentNode) {
       btnClone.parentNode.removeChild(btnClone);
+    }
+    var canvasesInClone = clone.querySelectorAll ? clone.querySelectorAll('canvas') : [];
+    for (var c = 0; c < canvasesInClone.length; c++) {
+      if (canvasesInClone[c].parentNode) {
+        canvasesInClone[c].parentNode.removeChild(canvasesInClone[c]);
+      }
     }
     var scripts = clone.querySelectorAll ? clone.querySelectorAll('script, link') : [];
     for (var k = 0; k < scripts.length; k++) {
@@ -307,12 +349,38 @@ export function injectFrameExporter(
     clone.style.width = w + 'px';
     clone.style.height = h + 'px';
     clone.style.margin = '0';
+    if (transparentRootBg) {
+      clone.style.background = 'transparent';
+      clone.style.backgroundColor = 'transparent';
+    }
     var xhtml = new XMLSerializer().serializeToString(clone);
     var bg = window.getComputedStyle(document.body).backgroundColor || '#000000';
+    var bgRect = transparentRootBg
+      ? ''
+      : '<rect width="100%" height="100%" fill="' + bg + '"/>';
     return '<svg xmlns="http://www.w3.org/2000/svg" width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '">' +
-      '<rect width="100%" height="100%" fill="' + bg + '"/>' +
+      bgRect +
       '<foreignObject width="100%" height="100%">' + xhtml + '</foreignObject>' +
       '</svg>';
+  }
+
+  function detectRichDomOverlays(allCanvases, allSvgs) {
+    var root = document.getElementById('stage') || document.body;
+    var children = root.querySelectorAll('*');
+    for (var i = 0; i < children.length; i++) {
+      var el = children[i];
+      if (btn && (el === btn || btn.contains(el))) continue;
+      var tag = el.tagName ? el.tagName.toLowerCase() : '';
+      if (tag === 'script' || tag === 'style' || tag === 'link' || tag === 'defs') continue;
+      if (allCanvases.indexOf(el) !== -1) continue;
+      if (allSvgs.length === 1 && (el === allSvgs[0] || allSvgs[0].contains(el))) continue;
+      if (el.id === 'stage' && (allCanvases.length === 1 || allSvgs.length === 1) && root.children.length === 1) continue;
+      var cs = window.getComputedStyle(el);
+      if (cs.display !== 'none' && cs.visibility !== 'hidden') {
+        return true;
+      }
+    }
+    return false;
   }
 
   async function exportAllFrames() {
@@ -352,9 +420,12 @@ export function injectFrameExporter(
       return za - zb;
     });
 
-    var frameW = (allCanvases[0] && allCanvases[0].width) || 1920;
-    var frameH = (allCanvases[0] && allCanvases[0].height) || 1080;
-    var needsComposite = allCanvases.length !== 1 || allSvgs.length > 0;
+    var frameW = (allCanvases[0] && allCanvases[0].width >= 1280 && allCanvases[0].width) || 1920;
+    var frameH = (allCanvases[0] && allCanvases[0].height >= 720 && allCanvases[0].height) || 1080;
+    var hasDomOverlays = detectRichDomOverlays(allCanvases, allSvgs);
+    var isPureSingleCanvas = allCanvases.length === 1 && allSvgs.length === 0 && !hasDomOverlays;
+    var isPureSingleSvg = allCanvases.length === 0 && allSvgs.length === 1 && !hasDomOverlays;
+    var needsComposite = !isPureSingleCanvas;
 
     var compositeCanvas = null;
     var compositeCtx = null;
@@ -394,9 +465,9 @@ export function injectFrameExporter(
             compositeCtx.fillRect(0, 0, frameW, frameH);
           }
 
-          if (allCanvases.length === 0 && allSvgs.length === 0) {
-            var domSvg = serializeDomStageToSvg(frameW, frameH);
-            await drawSvgStringToCtx(domSvg, compositeCtx, frameW, frameH);
+          if (isPureSingleSvg) {
+            var fullSvgStr = serializeStageSvg(allSvgs[0], frameW, frameH);
+            await drawSvgStringToCtx(fullSvgStr, compositeCtx, frameW, frameH);
           } else {
             for (var cIdx = 0; cIdx < allCanvases.length; cIdx++) {
               var layer = allCanvases[cIdx];
@@ -404,13 +475,8 @@ export function injectFrameExporter(
                 compositeCtx.drawImage(layer, 0, 0, frameW, frameH);
               }
             }
-            for (var sIdx = 0; sIdx < allSvgs.length; sIdx++) {
-              var svgLayer = allSvgs[sIdx];
-              if (window.getComputedStyle(svgLayer).display !== 'none') {
-                var svgStr = serializeStageSvg(svgLayer, frameW, frameH);
-                await drawSvgStringToCtx(svgStr, compositeCtx, frameW, frameH);
-              }
-            }
+            var domSvg = serializeDomStageToSvg(frameW, frameH, allCanvases.length > 0);
+            await drawSvgStringToCtx(domSvg, compositeCtx, frameW, frameH);
           }
           targetCanvas = compositeCanvas;
         }
@@ -740,8 +806,8 @@ async function startServer() {
       return;
     }
 
-    req.setTimeout(240_000);
-    res.setTimeout(240_000);
+    req.setTimeout(300_000);
+    res.setTimeout(300_000);
 
     const isSse = wantsSseStream(req);
     const { context, cleanup } = createRequestCascadeContext(req, res);
@@ -912,6 +978,7 @@ async function startServer() {
                 selectedStyleIds: result.selectedStyleIds,
                 renderTechnology: result.renderTechnology,
                 diagnostics: result.diagnostics,
+                qualityAudit: result.qualityAudit,
               },
             },
             diagnostics: result.diagnostics,
@@ -1065,6 +1132,7 @@ async function startServer() {
               html: htmlWithFrameExporter,
               totalDuration: rendered.totalDuration,
               diagnostics: rendered.diagnostics,
+              qualityAudit: rendered.qualityAudit,
             },
             diagnostics: rendered.diagnostics,
           };

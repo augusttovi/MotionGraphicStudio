@@ -1247,7 +1247,11 @@ export default function App() {
             </h2>
             <p className="text-xs text-[#9c8cb3]">
               {lastDirectMeta
-                ? `Estilo: ${lastDirectMeta.selectedStyleIds.map((id) => getStyleById(id).name).join(" + ")} · Tecnologia: ${lastDirectMeta.renderTechnology} · 60 FPS ZIP`
+                ? `Estilo: ${lastDirectMeta.selectedStyleIds.map((id) => getStyleById(id).name).join(" + ")} · Tecnologia: ${lastDirectMeta.renderTechnology}${
+                    lastDirectMeta.qualityAudit
+                      ? ` · ${lastDirectMeta.qualityAudit.metrics.detectedScenesOrChapters} cenas · ${lastDirectMeta.qualityAudit.metrics.vectorPathsCount} vetores · seek(t) determinístico`
+                      : ""
+                  } · 60 FPS ZIP`
                 : "1920×1080 Widescreen · Sincronia Determinística window.seek(t) · 60 FPS ZIP"}
             </p>
           </div>

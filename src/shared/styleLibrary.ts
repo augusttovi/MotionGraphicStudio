@@ -67,38 +67,40 @@ export const MOTION_STYLE_LIBRARY: MotionStyleSpec[] = [
     categoryLabel: "Storytelling e Explicação",
     preferredTechnology: "svg",
     visualCharacteristics:
-      "Formas vetoriais limpas, ícones conceituais modulares, paleta clara ou alto contraste amigável, conectores visuais e foco em um conceito central por quadro.",
+      "Ilustrações vetoriais editoriais detalhadas em múltiplas camadas (silhuetas arquitetônicas reconhecíveis, engrenagens, edifícios com fachadas/janelas, veículos, fluxos), combinadas a diagramas estruturados, grid editorial limpo e conectores curvos.",
     compositionTypes:
-      "Centro focal com suporte lateral em 2 colunas, progressão esquerda-para-direita de etapas e enquadramento limpo com amplo espaço negativo.",
+      "Grid editorial assimétrico de 12 colunas (ex: coluna narrativa + palco de diagrama/ilustração em camadas), enquadramentos macro-para-micro guiados por câmera virtual e espaço negativo intencional.",
     animationTechniques:
-      "Morphing simples entre ícones conceituais, revelação por máscara (clip-path), entradas com overshoot suave e destaque sequencial (stagger).",
+      "Construção progressiva de diagramas via trim-paths (stroke-dashoffset), morphing vetorial entre conceitos, revelação por máscara (clip-path), parallax 2.5D entre planos e tracking de câmera acompanhando fluxos causais.",
     typographyGuide:
-      "Plus Jakarta Sans ou Outfit Bold para afirmações curtas; corpo legível em peso médio com palavras-chave destacadas por cor de acento.",
+      "Fraunces, Playfair Display, Outfit ou Bricolage Grotesque para títulos com hierarquia de 3 níveis; Plus Jakarta Sans no apoio e JetBrains Mono tabular-nums para indicadores.",
     signatureMovements:
-      "Transição contínua onde um símbolo se transforma ou desliza para dar lugar à consequência lógica da explicação.",
+      "Câmera desliza e aproxima (dolly/pan) conectando organicamente um módulo ilustrado ao próximo elo da cadeia causal, com pulsos luminosos nos fluxos.",
     recommendedTransitions:
-      "Mask wipe circular, deslizamento coordenado de câmera (pan horizontal) e escala a partir do elemento conector.",
+      "Match-cut geométrico, mask wipe direcional, zoom-through de câmera em elemento focal e pan contínuo em tela panorâmica.",
     depthAndLayers:
-      "2 a 3 planos limpos: fundo sólido/gradiente sutil, camada de suporte geométrico discreto e plano principal de ícones + texto.",
+      "3 a 4 planos explícitos: malha/atmosfera editorial sutil ao fundo, camada estrutural de fluxos/eixos, plano principal de ilustrações vetoriais detalhadas e primeiro plano de callouts/títulos.",
     recommendedElements: [
-      "Ícones conceituais",
-      "Setas e linhas pontilhadas",
-      "Cartões de resumo",
-      "Indicadores numéricos de passo (01, 02, 03)",
+      "Ilustrações vetoriais multi-path (<symbol>/<path> curvos)",
+      "Fluxogramas causais com pulsos animados",
+      "Cabeçalho editorial de capítulo (01 / N)",
+      "Callouts com linhas-guia e métricas tabulares",
     ],
     bestUseCases:
-      "Explicação de processos, produtos, conceitos abstratos, resumos educativos e apresentações institucionais.",
+      "Documentários explicativos, economia, ciência, funcionamento de sistemas complexos, processos e apresentações de alto nível.",
     technicalCautions:
-      "Evite excesso de texto simultâneo; sincronize cada transformação visual com uma única ideia clara.",
+      "PROIBIDO substituir ilustrações por retângulos/círculos primitivos soltos; construa ícones e cenários vetoriais com múltiplos paths, sombras/volumes sutis e sincronia narrativa.",
     keywords: [
       "explicar",
+      "explicando",
       "como funciona",
       "passo a passo",
       "entenda",
       "conceito",
       "processo",
-      "solução",
-      "problema",
+      "sistema",
+      "economia",
+      "documentário",
       "resumo",
     ],
   },
@@ -1379,17 +1381,37 @@ export function recommendStylesForScript(script: string, limit: number = 4): Mot
         score += kw.includes(" ") ? 3 : 2;
       }
     }
-    // Heurísticas estruturais complementares
-    if (/%|\b\d+\s*(mil|milhões|bilhões|x|vezes)\b/i.test(script)) {
-      if (style.category === "data") score += 2.5;
+    // Heurísticas estruturais complementares para temas analíticos, econômicos, documentais e sistêmicos
+    if (
+      /%|\b\d+\s*(mil|milhões|bilhões|trilhões|x|vezes|gw|mw|km)\b|\b(pib|inflação|juros|emprego|balança|comércio|economia|indicadores|consumo|investimentos|governo|orçamento|receita|exportações)\b/i.test(
+        script
+      )
+    ) {
+      if (style.id === "animated-infographics") score += 4.5;
+      if (style.id === "3d-transforms-flowchart") score += 3.5;
+      if (style.id === "animated-charts-comparisons") score += 3.5;
+      if (style.id === "realtime-data-viz") score += 2.8;
+      if (style.id === "explainer-videos") score += 3.2;
+    }
+    if (/\b(fluxo|circulação|cadeia|ciclo|conexão|rede|ecossistema)\b/i.test(script)) {
+      if (style.id === "3d-transforms-flowchart") score += 4;
+      if (style.id === "isometric-flat-design") score += 2.5;
     }
     if (/["“”«»]/.test(script) && style.id === "social-proof-testimonial") {
       score += 2;
     }
-    if (/\b(19\d\d|20\d\d)\b/.test(script) && (style.id === "lower-thirds-broadcast" || style.id === "motion-collage-stopmotion")) {
+    if (
+      /\b(19\d\d|20\d\d)\b/.test(script) &&
+      (style.id === "lower-thirds-broadcast" ||
+        style.id === "motion-collage-stopmotion")
+    ) {
       score += 1.5;
     }
-    if (/\b(névoa|sombra|escuro|noite|silêncio|mistério|desapareceu|crime)\b/i.test(script)) {
+    if (
+      /\b(névoa|sombra|escuro|noite|silêncio|mistério|desapareceu|crime)\b/i.test(
+        script
+      )
+    ) {
       if (
         style.id === "paper-cutout-parallax" ||
         style.id === "particle-vfx-motion" ||
@@ -1404,17 +1426,19 @@ export function recommendStylesForScript(script: string, limit: number = 4): Mot
 
   scored.sort((a, b) => b.score - a.score || a.style.index - b.style.index);
 
-  const nonZero = scored.filter((item) => item.score > 0).map((item) => item.style);
+  const nonZero = scored
+    .filter((item) => item.score > 0)
+    .map((item) => item.style);
   if (nonZero.length >= limit) {
     return nonZero.slice(0, limit);
   }
 
-  // Complementa com estilos versáteis caso o roteiro seja aberto/abstrato
+  // Complementa com estilos versáteis de alto acabamento editorial
   const defaults: StyleId[] = [
+    "animated-infographics",
     "explainer-videos",
     "kinetic-text",
-    "particle-vfx-motion",
-    "animated-infographics",
+    "3d-transforms-flowchart",
   ];
   const result = [...nonZero];
   for (const defId of defaults) {
