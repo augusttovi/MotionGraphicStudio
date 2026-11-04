@@ -29,6 +29,8 @@ import type {
   ProviderAttemptDiagnostic,
   RegenerateSceneResponse,
   RenderStoryboardResponse,
+  StreamProgressEvent,
+  StreamProgressEventType,
   StyleCategory,
   StyleId,
   StyleSelection,
@@ -55,6 +57,13 @@ type StudioOperation =
   | "planning_storyboard"
   | "regenerating_scene"
   | "rendering_storyboard";
+
+interface LiveProgressStep {
+  id: string;
+  type: StreamProgressEventType;
+  message: string;
+  timestamp: string;
+}
 
 export default function App() {
   const [creationMode, setCreationMode] = useState<CreationMode>("direct");
@@ -97,6 +106,12 @@ export default function App() {
     | null
   >(null);
   const activeAbortRef = useRef<AbortController | null>(null);
+  const [liveProgressSteps, setLiveProgressSteps] = useState<LiveProgressStep[]>(
+    []
+  );
+  const [latestStreamStage, setLatestStreamStage] = useState<string | null>(
+    null
+  );
 
   const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
   const [activeGenerationTargetDuration, setActiveGenerationTargetDuration] =
@@ -185,6 +200,7 @@ export default function App() {
     }
     setRegeneratingSceneId(null);
     setOperation("idle");
+    setLatestStreamStage("A geração foi cancelada pelo usuário.");
     setErrorMessage("A geração foi cancelada pelo usuário.");
     setErrorDetails({
       failedProviders: [],
@@ -208,7 +224,37 @@ export default function App() {
     }
   }
 
-  async function postStudioJson<TResponse>(
+  const pushLiveStreamEvent = (evt: StreamProgressEvent<unknown>) => {
+    setLatestStreamStage(evt.message);
+    setLiveProgressSteps((prev) => {
+      // Se for atualização contínua de provider_progress do mesmo provedor, atualiza a última linha de progresso para manter o histórico enxuto
+      if (
+        evt.type === "provider_progress" &&
+        prev.length > 0 &&
+        prev[prev.length - 1].type === "provider_progress"
+      ) {
+        const updated = [...prev];
+        updated[updated.length - 1] = {
+          id: `${evt.timestamp}-${updated.length}`,
+          type: evt.type,
+          message: evt.message,
+          timestamp: evt.timestamp,
+        };
+        return updated;
+      }
+      return [
+        ...prev.slice(-7),
+        {
+          id: `${evt.timestamp}-${prev.length + 1}`,
+          type: evt.type,
+          message: evt.message,
+          timestamp: evt.timestamp,
+        },
+      ];
+    });
+  };
+
+  async function postStudioStream<TResponse>(
     url: string,
     body: unknown,
     signal: AbortSignal
@@ -217,7 +263,10 @@ export default function App() {
     try {
       response = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream, application/json",
+        },
         body: JSON.stringify(body),
         signal,
       });
@@ -244,7 +293,25 @@ export default function App() {
       response.headers.get("content-type") ?? ""
     ).toLowerCase();
 
-    if (!contentType.includes("application/json")) {
+    // Respostas de validação HTTP 400 ou fallback JSON síncrono
+    if (contentType.includes("application/json")) {
+      const parsed = (await response.json()) as TResponse &
+        Partial<ApiErrorPayload>;
+      if (!response.ok) {
+        throw new ClientApiError({
+          error:
+            parsed.error ||
+            "Não foi possível gerar a animação. Todos os provedores disponíveis falharam.",
+          errorType: parsed.errorType || "all_providers_failed",
+          generationId: parsed.generationId,
+          retryable: parsed.retryable ?? true,
+          failedProviders: parsed.failedProviders ?? [],
+        });
+      }
+      return parsed;
+    }
+
+    if (!contentType.includes("text/event-stream") || !response.body) {
       const isGatewayTimeout =
         response.status === 504 ||
         response.status === 502 ||
@@ -259,21 +326,121 @@ export default function App() {
       });
     }
 
-    const parsed = (await response.json()) as TResponse & Partial<ApiErrorPayload>;
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+    let finalResult: TResponse | undefined;
 
-    if (!response.ok) {
+    const processLine = (rawLine: string) => {
+      const trimmed = rawLine.trim();
+      if (!trimmed || trimmed.startsWith(":") || trimmed.startsWith("event:")) {
+        return;
+      }
+      if (!trimmed.startsWith("data:")) {
+        return;
+      }
+      const jsonStr = trimmed.slice(5).trim();
+      if (!jsonStr) return;
+
+      let evt: StreamProgressEvent<TResponse>;
+      try {
+        evt = JSON.parse(jsonStr) as StreamProgressEvent<TResponse>;
+      } catch {
+        return;
+      }
+
+      pushLiveStreamEvent(evt);
+
+      if (evt.type === "generation_completed" && evt.result !== undefined) {
+        finalResult = evt.result;
+        return;
+      }
+
+      if (evt.type === "generation_cancelled") {
+        throw new ClientApiError(
+          evt.errorPayload ?? {
+            error: evt.message || "A geração foi cancelada pelo usuário.",
+            errorType: "cancelled",
+            generationId: evt.generationId,
+            retryable: true,
+          }
+        );
+      }
+
+      if (evt.type === "generation_failed") {
+        throw new ClientApiError(
+          evt.errorPayload ?? {
+            error:
+              evt.message ||
+              "Não foi possível gerar a animação. Todos os provedores disponíveis falharam.",
+            errorType: evt.errorType || "all_providers_failed",
+            generationId: evt.generationId,
+            retryable: true,
+          }
+        );
+      }
+    };
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          buffer += decoder.decode();
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+
+        let newlineIndex = buffer.indexOf("\n");
+        while (newlineIndex !== -1) {
+          const line = buffer.slice(0, newlineIndex);
+          buffer = buffer.slice(newlineIndex + 1);
+          newlineIndex = buffer.indexOf("\n");
+          processLine(line);
+        }
+      }
+
+      if (buffer.trim()) {
+        for (const remainingLine of buffer.split("\n")) {
+          processLine(remainingLine);
+        }
+      }
+    } catch (streamErr) {
+      if (streamErr instanceof ClientApiError) {
+        throw streamErr;
+      }
+      if (
+        signal.aborted ||
+        (streamErr instanceof Error && streamErr.name === "AbortError")
+      ) {
+        throw new ClientApiError({
+          error: "A geração foi cancelada pelo usuário.",
+          errorType: "cancelled",
+          retryable: true,
+        });
+      }
       throw new ClientApiError({
         error:
-          parsed.error ||
-          "Não foi possível gerar a animação. Todos os provedores disponíveis falharam.",
-        errorType: parsed.errorType || "all_providers_failed",
-        generationId: parsed.generationId,
-        retryable: parsed.retryable ?? true,
-        failedProviders: parsed.failedProviders ?? [],
+          "A conexão em tempo real com o servidor foi interrompida antes de finalizar. Tente novamente.",
+        errorType: "network_error",
+        retryable: true,
+      });
+    } finally {
+      if (signal.aborted) {
+        await reader.cancel().catch(() => {});
+      }
+      reader.releaseLock();
+    }
+
+    if (finalResult === undefined) {
+      throw new ClientApiError({
+        error:
+          "A transmissão foi encerrada sem entregar o resultado final validado. Tente novamente.",
+        errorType: "invalid_response",
+        retryable: true,
       });
     }
 
-    return parsed;
+    return finalResult;
   }
 
   function applyCaughtOperationError(error: unknown) {
@@ -321,14 +488,16 @@ export default function App() {
 
     setLastFailedAction({ type: "direct" });
     setActiveGenerationTargetDuration(liveEstimatedDuration);
+    setLiveProgressSteps([]);
+    setLatestStreamStage("Analisando roteiro...");
     setOperation("generating_direct");
     setErrorMessage(null);
     setErrorDetails(null);
     setExportProgress({ active: false });
 
     try {
-      const data = await postStudioJson<DirectGenerateResponse>(
-        "/api/generate",
+      const data = await postStudioStream<DirectGenerateResponse>(
+        "/api/generate/stream",
         {
           script: trimmed,
           preferredStyleId,
@@ -381,14 +550,16 @@ export default function App() {
     activeAbortRef.current = controller;
 
     setLastFailedAction({ type: "plan" });
+    setLiveProgressSteps([]);
+    setLatestStreamStage("Analisando roteiro e planejando direção de arte...");
     setOperation("planning_storyboard");
     setErrorMessage(null);
     setErrorDetails(null);
     setNeighborImpactNotes([]);
 
     try {
-      const data = await postStudioJson<PlanStoryboardResponse>(
-        "/api/storyboard/plan",
+      const data = await postStudioStream<PlanStoryboardResponse>(
+        "/api/storyboard/plan/stream",
         {
           script: trimmed,
           preferredStyleId,
@@ -442,14 +613,16 @@ export default function App() {
       instruction,
       requestedStyleId,
     });
+    setLiveProgressSteps([]);
+    setLatestStreamStage("Regenerando cena selecionada...");
     setOperation("regenerating_scene");
     setRegeneratingSceneId(sceneId);
     setErrorMessage(null);
     setErrorDetails(null);
 
     try {
-      const data = await postStudioJson<RegenerateSceneResponse>(
-        "/api/storyboard/regenerate-scene",
+      const data = await postStudioStream<RegenerateSceneResponse>(
+        "/api/storyboard/regenerate-scene/stream",
         {
           project: storyboardProject,
           sceneId,
@@ -491,6 +664,8 @@ export default function App() {
 
     setLastFailedAction({ type: "render" });
     setActiveGenerationTargetDuration(storyboardProject.timeline.totalDuration);
+    setLiveProgressSteps([]);
+    setLatestStreamStage("Preparando storyboard aprovado para renderização...");
     setOperation("rendering_storyboard");
     setErrorMessage(null);
     setErrorDetails(null);
@@ -503,8 +678,8 @@ export default function App() {
     });
 
     try {
-      const data = await postStudioJson<RenderStoryboardResponse>(
-        "/api/storyboard/render",
+      const data = await postStudioStream<RenderStoryboardResponse>(
+        "/api/storyboard/render/stream",
         {
           project: storyboardProject,
         },
@@ -599,16 +774,19 @@ export default function App() {
   const selectedStylePreview =
     preferredStyleId !== "auto" ? getStyleById(preferredStyleId) : null;
 
-  // Descrição transparente do status atual do estúdio
+  // Descrição transparente do status atual do estúdio sincronizada com eventos reais do backend
   const statusBannerText = useMemo(() => {
+    if (isBusy && latestStreamStage) {
+      return latestStreamStage;
+    }
     if (operation === "generating_direct") {
-      return "Modo Direto ativo: a IA está interpretando o roteiro, definindo a direção criativa e renderizando o HTML determinístico...";
+      return "Analisando roteiro e definindo direção de arte...";
     }
     if (operation === "planning_storyboard") {
-      return "Modo Storyboard ativo: o Diretor Criativo de IA está dividindo o roteiro em cenas, paleta, estilo e timeline adaptativa...";
+      return "Analisando roteiro e planejando direção de arte...";
     }
     if (operation === "regenerating_scene") {
-      return "Regenerando a cena selecionada com memória das cenas vizinhas e preservação das decisões aprovadas...";
+      return "Regenerando a cena selecionada com memória das cenas vizinhas...";
     }
     if (operation === "rendering_storyboard") {
       return "Renderizando a animação final fielmente a partir do Storyboard aprovado...";
@@ -616,18 +794,18 @@ export default function App() {
     if (creationMode === "storyboard" && storyboardProject) {
       if (storyboardProject.approvalStatus === "approved") {
         return generatedHtml
-          ? "Storyboard aprovado e animação final renderizada no Preview."
+          ? "Animação concluída! Storyboard aprovado e renderizado no Preview."
           : "Storyboard aprovado. Clique em 'Gerar Animação Aprovada' para produzir o motion graphic.";
       }
       return "Storyboard pronto para revisão: edite textos, durações ou cenas e aprove quando desejar renderizar.";
     }
     if (generatedHtml) {
-      return "Animação pronta no Preview 16:9 com suporte determinístico seek(t) e exportação 60 FPS.";
+      return "Animação concluída! Pronta no Preview 16:9 com suporte determinístico seek(t) e exportação 60 FPS.";
     }
     return creationMode === "direct"
       ? "Modo Geração Direta selecionado: cole o roteiro e a IA assumirá a direção criativa completa até a animação final."
       : "Modo Storyboard com Aprovação selecionado: a IA apresentará direção de arte e cenas editáveis antes de renderizar.";
-  }, [creationMode, generatedHtml, operation, storyboardProject]);
+  }, [creationMode, generatedHtml, isBusy, latestStreamStage, operation, storyboardProject]);
 
   return (
     <div className="min-h-screen flex flex-col bg-[#050507] text-[#f3eff8]">
@@ -841,6 +1019,63 @@ export default function App() {
             className="w-full min-h-[210px] rounded-xl bg-[#0d0914] border border-[#8a2be2]/30 focus:border-[#8a2be2] focus:outline-none focus:ring-2 focus:ring-[#8a2be2]/40 px-5 py-4 text-sm sm:text-base text-[#f5f0fc] placeholder:text-[#66577d] leading-relaxed resize-y transition-colors disabled:opacity-60"
           />
 
+          {(isBusy ||
+            (liveProgressSteps.length > 0 &&
+              liveProgressSteps[liveProgressSteps.length - 1]?.type ===
+                "generation_completed" &&
+              !errorMessage)) && (
+            <div
+              aria-live="polite"
+              className="rounded-xl border border-[#8a2be2]/35 bg-[#0f0a19] px-4 py-3.5 space-y-2.5"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div className="flex items-center gap-2 font-medium text-[#ece3fa]">
+                  {isBusy ? (
+                    <Loader2 className="w-4 h-4 text-[#b589f7] animate-spin shrink-0" />
+                  ) : (
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  )}
+                  <span>
+                    {latestStreamStage || "Conectando ao provedor de IA..."}
+                  </span>
+                </div>
+                {isBusy && (
+                  <span className="font-mono text-[11px] tabular-nums text-[#a594bd]">
+                    {elapsedSeconds.toFixed(1)}s decorridos
+                  </span>
+                )}
+              </div>
+
+              {liveProgressSteps.length > 1 && (
+                <ul className="space-y-1 border-t border-[#8a2be2]/15 pt-2 text-xs text-[#a899bd]">
+                  {liveProgressSteps.map((step, idx) => {
+                    const isLast = idx === liveProgressSteps.length - 1;
+                    return (
+                      <li
+                        key={step.id}
+                        className={`flex items-baseline gap-2 ${
+                          step.type === "provider_failed" ||
+                          step.type === "fallback_started"
+                            ? "text-amber-200/90"
+                            : step.type === "generation_completed"
+                              ? "text-emerald-300 font-medium"
+                              : isLast
+                                ? "text-[#e9dff8]"
+                                : "text-[#8a7aa3]"
+                        }`}
+                      >
+                        <span className="font-mono text-[10px] opacity-70 shrink-0">
+                          {String(idx + 1).padStart(2, "0")}.
+                        </span>
+                        <span>{step.message}</span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </div>
+          )}
+
           {errorMessage && (
             <div
               role="alert"
@@ -1035,9 +1270,10 @@ export default function App() {
                 : "Dirigindo e Compondo Motion Graphic"
             }
             loadingSubtitle={
-              operation === "rendering_storyboard"
+              latestStreamStage ||
+              (operation === "rendering_storyboard"
                 ? `Executando as ${storyboardProject?.scenes.length ?? 0} cenas aprovadas em 1920×1080 com sincronia window.seek(t)...`
-                : "Interpretando o roteiro, aplicando direção de arte especializada e compilando window.seek(t)..."
+                : "Interpretando o roteiro, aplicando direção de arte especializada e compilando window.seek(t)...")
             }
           />
 

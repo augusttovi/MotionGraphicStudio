@@ -6,10 +6,16 @@ import path from "node:path";
 import type {
   ApiErrorPayload,
   DirectGenerateRequest,
+  DirectGenerateResponse,
+  ExecutionDiagnosticsSummary,
   PlanStoryboardRequest,
+  PlanStoryboardResponse,
   ProjectContextMemory,
   RegenerateSceneRequest,
+  RegenerateSceneResponse,
   RenderStoryboardRequest,
+  RenderStoryboardResponse,
+  StreamProgressEvent,
 } from "./src/shared/motionStudioContracts.ts";
 import {
   MOTION_STYLE_LIBRARY,
@@ -25,6 +31,8 @@ import type { CascadeRunContext } from "./server/creativePipeline.ts";
 import {
   CascadeExecutionError,
   diagnoseProvidersHealth,
+  getActiveCascadeTelemetry,
+  getCascadeTotalBudgetMs,
   sanitizeDiagnosticText,
 } from "./server/providerCascade.ts";
 import type { CascadeSimulationMap } from "./server/providerCascade.ts";
@@ -572,7 +580,9 @@ async function startServer() {
     });
   });
 
-  // Diagnóstico seguro de conectividade e configuração dos provedores (nunca expõe chaves/segredos)
+  let activeSseStreams = 0;
+
+  // Diagnóstico seguro de conectividade, orçamento de cascata e telemetria de recursos (sem expor segredos)
   app.get("/api/providers/health", async (req: Request, res: Response) => {
     try {
       const probe = req.query.probe === "true" || req.query.probe === "1";
@@ -581,6 +591,11 @@ async function startServer() {
         ok: true,
         probed: probe,
         checkedAt: new Date().toISOString(),
+        cascadeTotalBudgetMs: getCascadeTotalBudgetMs(),
+        telemetry: {
+          ...getActiveCascadeTelemetry(),
+          activeSseStreams,
+        },
         providers,
       });
     } catch (error) {
@@ -607,6 +622,7 @@ async function startServer() {
     res: Response
   ): { context: CascadeRunContext; cleanup: () => void } {
     const clientAbortController = new AbortController();
+    const socket = req.socket;
 
     const onDisconnect = () => {
       if (!res.writableEnded && !clientAbortController.signal.aborted) {
@@ -616,6 +632,7 @@ async function startServer() {
 
     req.on("aborted", onDisconnect);
     res.on("close", onDisconnect);
+    socket?.on("close", onDisconnect);
 
     let simulationFaults: CascadeSimulationMap | undefined;
     if (!isProduction && isLoopbackRequest(req)) {
@@ -632,6 +649,7 @@ async function startServer() {
     const cleanup = () => {
       req.off("aborted", onDisconnect);
       res.off("close", onDisconnect);
+      socket?.off("close", onDisconnect);
     };
 
     return {
@@ -643,14 +661,15 @@ async function startServer() {
     };
   }
 
-  function sendStructuredApiError(res: Response, error: unknown): void {
-    if (res.headersSent || res.writableEnded) {
-      return;
-    }
-
+  function buildStructuredApiError(error: unknown): {
+    statusCode: number;
+    payload: ApiErrorPayload;
+  } {
     if (error instanceof CascadeExecutionError) {
-      res.status(error.statusCode).json(error.toApiErrorPayload());
-      return;
+      return {
+        statusCode: error.statusCode,
+        payload: error.toApiErrorPayload(),
+      };
     }
 
     const safeReason =
@@ -658,189 +677,401 @@ async function startServer() {
         ? sanitizeDiagnosticText(error.message)
         : "Erro interno ao processar a solicitação.";
 
-    const payload: ApiErrorPayload = {
-      error: safeReason || "Não foi possível concluir a operação solicitada.",
-      errorType: "provider_unavailable",
-      retryable: true,
+    return {
+      statusCode: 500,
+      payload: {
+        error: safeReason || "Não foi possível concluir a operação solicitada.",
+        errorType: "provider_unavailable",
+        retryable: true,
+      },
     };
-    res.status(500).json(payload);
   }
 
-  // MODO A — Endpoint principal compatível de Geração Direta com Direção Criativa Autônoma
-  app.post("/api/generate", async (req: Request, res: Response) => {
+  function sendStructuredApiError(res: Response, error: unknown): void {
+    if (res.headersSent || res.writableEnded) {
+      return;
+    }
+    const { statusCode, payload } = buildStructuredApiError(error);
+    res.status(statusCode).json(payload);
+  }
+
+  function wantsSseStream(req: Request): boolean {
+    if (req.path.endsWith("/stream")) return true;
+    if (req.query.stream === "true" || req.query.stream === "1") return true;
+    const accept = (req.header("accept") || "").toLowerCase();
+    return accept.includes("text/event-stream");
+  }
+
+  function writeSseEvent<TResult>(
+    res: Response,
+    event: StreamProgressEvent<TResult>
+  ): void {
+    if (res.writableEnded || res.destroyed) return;
+    try {
+      res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      const flushable = res as Response & { flush?: () => void };
+      if (typeof flushable.flush === "function") {
+        flushable.flush();
+      }
+    } catch {
+      // Socket do cliente já foi encerrado
+    }
+  }
+
+  async function executeStudioEndpoint<TResponse>(
+    req: Request,
+    res: Response,
+    options: {
+      operation: string;
+      completionMessage: string;
+      validate: () => ApiErrorPayload | null;
+      run: (
+        context: CascadeRunContext,
+        emitStageNote: (message: string) => void
+      ) => Promise<{
+        payload: TResponse;
+        diagnostics: ExecutionDiagnosticsSummary;
+      }>;
+    }
+  ): Promise<void> {
+    const validationErr = options.validate();
+    if (validationErr) {
+      res.status(400).json(validationErr);
+      return;
+    }
+
     req.setTimeout(240_000);
     res.setTimeout(240_000);
+
+    const isSse = wantsSseStream(req);
     const { context, cleanup } = createRequestCascadeContext(req, res);
-    try {
-      const body = req.body as Partial<DirectGenerateRequest>;
-      const script = body?.script;
 
-      if (!script || typeof script !== "string" || !script.trim()) {
-        const errPayload: ApiErrorPayload = {
-          error: "Por favor, insira um roteiro antes de gerar a animação.",
-          errorType: "validation_error",
-          retryable: false,
-        };
-        res.status(400).json(errPayload);
-        return;
-      }
-
-      const result = await generateDirectMotionWithAI(
-        {
-          script: script.trim(),
-          preferredStyleId: body.preferredStyleId,
-          creativeNotes: body.creativeNotes,
-        },
-        context
-      );
-
-      const htmlWithFrameExporter = injectFrameExporter(
-        result.html,
-        result.estimatedDuration
-      );
-
-      if (!res.writableEnded) {
-        res.json({
-          html: htmlWithFrameExporter,
-          meta: {
-            estimatedDuration: result.estimatedDuration,
-            selectedStyleIds: result.selectedStyleIds,
-            renderTechnology: result.renderTechnology,
-            diagnostics: result.diagnostics,
-          },
-        });
-      }
-    } catch (error: unknown) {
-      sendStructuredApiError(res, error);
-    } finally {
-      cleanup();
-    }
-  });
-
-  // MODO B (Etapa 1) — Planejamento de Direção de Arte e Storyboard estruturado
-  app.post("/api/storyboard/plan", async (req: Request, res: Response) => {
-    req.setTimeout(240_000);
-    res.setTimeout(240_000);
-    const { context, cleanup } = createRequestCascadeContext(req, res);
-    try {
-      const body = req.body as Partial<PlanStoryboardRequest>;
-      if (!body.script || typeof body.script !== "string" || !body.script.trim()) {
-        const errPayload: ApiErrorPayload = {
-          error: "Insira um roteiro válido para planejar o storyboard.",
-          errorType: "validation_error",
-          retryable: false,
-        };
-        res.status(400).json(errPayload);
-        return;
-      }
-
-      const result = await planStoryboardWithAI(
-        {
-          script: body.script.trim(),
-          preferredStyleId: body.preferredStyleId,
-          creativeNotes: body.creativeNotes,
-        },
-        context
-      );
-
-      if (!res.writableEnded) {
-        res.json({
-          project: result.project,
-          diagnostics: result.diagnostics,
-        });
-      }
-    } catch (error: unknown) {
-      sendStructuredApiError(res, error);
-    } finally {
-      cleanup();
-    }
-  });
-
-  // MODO B (Etapa 2 opcional) — Regeneração individual de uma cena preservando memória e vizinhança
-  app.post(
-    "/api/storyboard/regenerate-scene",
-    async (req: Request, res: Response) => {
-      req.setTimeout(240_000);
-      res.setTimeout(240_000);
-      const { context, cleanup } = createRequestCascadeContext(req, res);
+    if (!isSse) {
       try {
-        const body = req.body as Partial<RegenerateSceneRequest>;
-        if (
-          !body.project ||
-          !Array.isArray(body.project.scenes) ||
-          !body.sceneId ||
-          typeof body.sceneId !== "string"
-        ) {
-          const errPayload: ApiErrorPayload = {
-            error:
-              "Projeto ou identificador estável da cena ausente para regeneração.",
-            errorType: "validation_error",
-            retryable: false,
-          };
-          res.status(400).json(errPayload);
-          return;
-        }
-
-        const outcome = await regenerateSceneWithAI(
-          {
-            project: body.project as ProjectContextMemory,
-            sceneId: body.sceneId,
-            instruction: body.instruction,
-            requestedStyleId: body.requestedStyleId,
-          },
-          context
-        );
-
+        const { payload } = await options.run(context, () => {});
         if (!res.writableEnded) {
-          res.json(outcome);
+          res.json(payload);
         }
       } catch (error: unknown) {
         sendStructuredApiError(res, error);
       } finally {
         cleanup();
       }
+      return;
     }
-  );
 
-  // MODO B (Etapa 3) — Renderização Final a partir do Storyboard e Memória do Projeto aprovados
-  app.post("/api/storyboard/render", async (req: Request, res: Response) => {
-    req.setTimeout(240_000);
-    res.setTimeout(240_000);
-    const { context, cleanup } = createRequestCascadeContext(req, res);
-    try {
-      const body = req.body as Partial<RenderStoryboardRequest>;
-      const project = body.project;
+    // Modo Streaming Real Servidor -> Navegador via Server-Sent Events (SSE)
+    activeSseStreams += 1;
+    let activeGenerationId = "gen_stream";
+    let terminalEventSent = false;
 
-      if (!project || !Array.isArray(project.scenes) || project.scenes.length === 0) {
-        const errPayload: ApiErrorPayload = {
-          error:
-            "Envie o storyboard válido com ao menos uma cena para gerar a animação.",
-          errorType: "validation_error",
-          retryable: false,
-        };
-        res.status(400).json(errPayload);
-        return;
+    res.status(200);
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    req.socket?.setNoDelay(true);
+    res.flushHeaders();
+    res.write(`: stream-open ${new Date().toISOString()}\n\n`);
+
+    const keepAliveTimer = setInterval(() => {
+      if (
+        !res.writableEnded &&
+        !res.destroyed &&
+        !context.clientSignal?.aborted
+      ) {
+        try {
+          res.write(`: keepalive ${Date.now()}\n\n`);
+          const flushable = res as Response & { flush?: () => void };
+          if (typeof flushable.flush === "function") {
+            flushable.flush();
+          }
+        } catch {
+          // Conexão encerrada
+        }
       }
+    }, 3_500);
 
-      const rendered = await renderApprovedStoryboardWithAI(project, context);
-      const htmlWithFrameExporter = injectFrameExporter(
-        rendered.html,
-        rendered.totalDuration
+    context.onProgressEvent = (evt) => {
+      if (evt.generationId) {
+        activeGenerationId = evt.generationId;
+      }
+      if (
+        evt.type === "generation_completed" ||
+        evt.type === "generation_failed" ||
+        evt.type === "generation_cancelled"
+      ) {
+        terminalEventSent = true;
+      }
+      writeSseEvent(res, evt);
+    };
+
+    const emitStageNote = (message: string) => {
+      if (terminalEventSent || context.clientSignal?.aborted) return;
+      writeSseEvent(res, {
+        type: "provider_progress",
+        generationId: activeGenerationId,
+        operation: options.operation,
+        timestamp: new Date().toISOString(),
+        message,
+      });
+    };
+
+    try {
+      const { payload, diagnostics } = await options.run(
+        context,
+        emitStageNote
       );
 
-      if (!res.writableEnded) {
-        res.json({
-          html: htmlWithFrameExporter,
-          totalDuration: rendered.totalDuration,
-          diagnostics: rendered.diagnostics,
+      if (!terminalEventSent && !context.clientSignal?.aborted) {
+        terminalEventSent = true;
+        writeSseEvent<TResponse>(res, {
+          type: "generation_completed",
+          generationId: diagnostics.generationId || activeGenerationId,
+          operation: options.operation,
+          timestamp: new Date().toISOString(),
+          provider: diagnostics.providerUsed,
+          providerLabel: diagnostics.providerLabel,
+          model: diagnostics.modelUsed,
+          durationMs: diagnostics.durationMs,
+          message: options.completionMessage,
+          result: payload,
         });
       }
     } catch (error: unknown) {
-      sendStructuredApiError(res, error);
+      if (!terminalEventSent && !res.writableEnded && !res.destroyed) {
+        terminalEventSent = true;
+        const { payload: errPayload } = buildStructuredApiError(error);
+        const isCancelled =
+          errPayload.errorType === "cancelled" ||
+          Boolean(context.clientSignal?.aborted);
+        writeSseEvent(res, {
+          type: isCancelled ? "generation_cancelled" : "generation_failed",
+          generationId: errPayload.generationId || activeGenerationId,
+          operation: options.operation,
+          timestamp: new Date().toISOString(),
+          errorType: errPayload.errorType,
+          message: errPayload.error,
+          errorPayload: errPayload,
+        });
+      }
     } finally {
+      clearInterval(keepAliveTimer);
+      activeSseStreams = Math.max(0, activeSseStreams - 1);
       cleanup();
+      if (!res.writableEnded && !res.destroyed) {
+        res.end();
+      }
     }
-  });
+  }
+
+  // MODO A — Endpoint principal compatível de Geração Direta (JSON legado + SSE em tempo real)
+  app.post(
+    ["/api/generate", "/api/generate/stream"],
+    async (req: Request, res: Response) => {
+      const body = req.body as Partial<DirectGenerateRequest>;
+      const script = body?.script;
+
+      await executeStudioEndpoint<DirectGenerateResponse>(req, res, {
+        operation: "direct_generate",
+        completionMessage: "Animação concluída!",
+        validate: () => {
+          if (!script || typeof script !== "string" || !script.trim()) {
+            return {
+              error: "Por favor, insira um roteiro antes de gerar a animação.",
+              errorType: "validation_error",
+              retryable: false,
+            };
+          }
+          return null;
+        },
+        run: async (context, emitStageNote) => {
+          const result = await generateDirectMotionWithAI(
+            {
+              script: script!.trim(),
+              preferredStyleId: body.preferredStyleId,
+              creativeNotes: body.creativeNotes,
+            },
+            context
+          );
+
+          // Injeção do exportador de frames SOMENTE após a validação integral do HTML
+          emitStageNote(
+            "Preparando exportador determinístico de frames 60 FPS..."
+          );
+          const htmlWithFrameExporter = injectFrameExporter(
+            result.html,
+            result.estimatedDuration
+          );
+
+          return {
+            payload: {
+              html: htmlWithFrameExporter,
+              meta: {
+                estimatedDuration: result.estimatedDuration,
+                selectedStyleIds: result.selectedStyleIds,
+                renderTechnology: result.renderTechnology,
+                diagnostics: result.diagnostics,
+              },
+            },
+            diagnostics: result.diagnostics,
+          };
+        },
+      });
+    }
+  );
+
+  // MODO B (Etapa 1) — Planejamento de Direção de Arte e Storyboard estruturado (JSON + SSE)
+  app.post(
+    ["/api/storyboard/plan", "/api/storyboard/plan/stream"],
+    async (req: Request, res: Response) => {
+      const body = req.body as Partial<PlanStoryboardRequest>;
+
+      await executeStudioEndpoint<PlanStoryboardResponse>(req, res, {
+        operation: "storyboard_plan",
+        completionMessage: "Planejamento de storyboard concluído!",
+        validate: () => {
+          if (
+            !body.script ||
+            typeof body.script !== "string" ||
+            !body.script.trim()
+          ) {
+            return {
+              error: "Insira um roteiro válido para planejar o storyboard.",
+              errorType: "validation_error",
+              retryable: false,
+            };
+          }
+          return null;
+        },
+        run: async (context) => {
+          const result = await planStoryboardWithAI(
+            {
+              script: body.script!.trim(),
+              preferredStyleId: body.preferredStyleId,
+              creativeNotes: body.creativeNotes,
+            },
+            context
+          );
+          return {
+            payload: {
+              project: result.project,
+              diagnostics: result.diagnostics,
+            },
+            diagnostics: result.diagnostics,
+          };
+        },
+      });
+    }
+  );
+
+  // MODO B (Etapa 2 opcional) — Regeneração individual de uma cena (JSON + SSE)
+  app.post(
+    [
+      "/api/storyboard/regenerate-scene",
+      "/api/storyboard/regenerate-scene/stream",
+    ],
+    async (req: Request, res: Response) => {
+      const body = req.body as Partial<RegenerateSceneRequest>;
+
+      await executeStudioEndpoint<RegenerateSceneResponse>(req, res, {
+        operation: "storyboard_regenerate_scene",
+        completionMessage: "Cena regenerada com sucesso!",
+        validate: () => {
+          if (
+            !body.project ||
+            !Array.isArray(body.project.scenes) ||
+            !body.sceneId ||
+            typeof body.sceneId !== "string"
+          ) {
+            return {
+              error:
+                "Projeto ou identificador estável da cena ausente para regeneração.",
+              errorType: "validation_error",
+              retryable: false,
+            };
+          }
+          return null;
+        },
+        run: async (context) => {
+          const outcome = await regenerateSceneWithAI(
+            {
+              project: body.project as ProjectContextMemory,
+              sceneId: body.sceneId!,
+              instruction: body.instruction,
+              requestedStyleId: body.requestedStyleId,
+            },
+            context
+          );
+          return {
+            payload: outcome,
+            diagnostics:
+              outcome.diagnostics ?? {
+                generationId: "gen_regen",
+                providerUsed: "gemini",
+                providerLabel: "Google Gemini",
+                modelUsed: "gemini",
+                durationMs: 0,
+                attemptsCount: 1,
+              },
+          };
+        },
+      });
+    }
+  );
+
+  // MODO B (Etapa 3) — Renderização Final a partir do Storyboard aprovado (JSON + SSE)
+  app.post(
+    ["/api/storyboard/render", "/api/storyboard/render/stream"],
+    async (req: Request, res: Response) => {
+      const body = req.body as Partial<RenderStoryboardRequest>;
+      const project = body.project;
+
+      await executeStudioEndpoint<RenderStoryboardResponse>(req, res, {
+        operation: "storyboard_render",
+        completionMessage: "Animação concluída!",
+        validate: () => {
+          if (
+            !project ||
+            !Array.isArray(project.scenes) ||
+            project.scenes.length === 0
+          ) {
+            return {
+              error:
+                "Envie o storyboard válido com ao menos uma cena para gerar a animação.",
+              errorType: "validation_error",
+              retryable: false,
+            };
+          }
+          return null;
+        },
+        run: async (context, emitStageNote) => {
+          const rendered = await renderApprovedStoryboardWithAI(
+            project!,
+            context
+          );
+
+          // Injeção do exportador de frames SOMENTE após validação integral do HTML
+          emitStageNote(
+            "Preparando exportador determinístico de frames 60 FPS..."
+          );
+          const htmlWithFrameExporter = injectFrameExporter(
+            rendered.html,
+            rendered.totalDuration
+          );
+
+          return {
+            payload: {
+              html: htmlWithFrameExporter,
+              totalDuration: rendered.totalDuration,
+              diagnostics: rendered.diagnostics,
+            },
+            diagnostics: rendered.diagnostics,
+          };
+        },
+      });
+    }
+  );
 
   // Catch-all para rotas /api/* não encontradas (sempre retorna JSON)
   app.all("/api/*", (_req: Request, res: Response) => {

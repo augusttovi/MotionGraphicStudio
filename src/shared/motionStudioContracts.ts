@@ -210,6 +210,34 @@ export interface ApiErrorPayload {
   failedProviders?: ProviderAttemptDiagnostic[];
 }
 
+// Eventos SSE de Streaming Real Servidor -> Navegador
+export type StreamProgressEventType =
+  | "generation_started"
+  | "provider_started"
+  | "provider_progress"
+  | "provider_failed"
+  | "fallback_started"
+  | "generation_completed"
+  | "generation_failed"
+  | "generation_cancelled";
+
+export interface StreamProgressEvent<TResult = unknown> {
+  type: StreamProgressEventType;
+  generationId: string;
+  operation: string;
+  timestamp: string;
+  message: string;
+  provider?: AIProviderId;
+  providerLabel?: string;
+  model?: string;
+  attemptNumber?: number;
+  receivedChars?: number;
+  errorType?: ProviderErrorType | "all_providers_failed" | "validation_error";
+  durationMs?: number;
+  result?: TResult;
+  errorPayload?: ApiErrorPayload;
+}
+
 // Contratos de Requisição e Resposta HTTP
 export interface DirectGenerateRequest {
   script: string;

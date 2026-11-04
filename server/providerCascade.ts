@@ -10,13 +10,19 @@ import type {
   ExecutionDiagnosticsSummary,
   ProviderAttemptDiagnostic,
   ProviderErrorType,
+  StreamProgressEvent,
 } from "../src/shared/motionStudioContracts.ts";
 
 /**
- * Modelos reais e verificados nos catálogos oficiais:
- * 1. Google Gemini (@google/genai): "gemini-3.8-flash" (com fallback automático de modelo para "gemini-flash-latest" se 404/indisponível)
- * 2. OpenRouter (https://openrouter.ai/api/v1/models): "openrouter/free"
- * 3. NVIDIA NIM (https://integrate.api.nvidia.com/v1/models): "deepseek-ai/deepseek-v4.1-flash" (rápido e não trava em reasoning de 65k tokens, com fallback secundário "nvidia/nemotron-3-ultra-550b-a55b")
+ * Modelos configurados e verificados em execução real nos catálogos oficiais:
+ * 1. Google Gemini (@google/genai):
+ *    - Primário: "gemini-3.8-flash"
+ *    - Fallbacks internos de modelo (em caso de HTTP 503 alta demanda ou 404): "gemini-3.1-flash-lite", "gemini-flash-latest"
+ * 2. OpenRouter (https://openrouter.ai/api/v1/models):
+ *    - Primário: "openrouter/free" (com reasoning desativado para evitar consumo silencioso do orçamento)
+ * 3. NVIDIA NIM (https://integrate.api.nvidia.com/v1/models):
+ *    - Primário: "nvidia/nemotron-3.5-lightning-30b-a3b" (com enable_thinking: false)
+ *    - Fallback secundário: "mistralai/mistral-large-2-instruct"
  */
 export const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";
 export const FALLBACK_GEMINI_LITE_MODEL = "gemini-3.1-flash-lite";
@@ -30,8 +36,42 @@ export const OPENROUTER_CHAT_ENDPOINT =
 export const NVIDIA_CHAT_ENDPOINT =
   "https://integrate.api.nvidia.com/v1/chat/completions";
 
-const MIN_TIMEOUT_MS = 100;
-const MAX_TIMEOUT_MS = 180_000;
+/**
+ * Orçamentos padrão coordenados para caber confortavelmente nos limites reais de proxy HTTP,
+ * combinados com streaming SSE contínuo até o navegador:
+ * - Gemini: 45s (inatividade máx 20s)
+ * - OpenRouter: 38s (inatividade máx 18s)
+ * - NVIDIA NIM: 38s (inatividade máx 18s)
+ * - Teto global previsível da cascata inteira: 95s (CASCADE_TOTAL_BUDGET_MS)
+ */
+export const DEFAULT_GEMINI_TIMEOUT_MS = 45_000;
+export const DEFAULT_OPENROUTER_TIMEOUT_MS = 38_000;
+export const DEFAULT_NVIDIA_TIMEOUT_MS = 38_000;
+export const DEFAULT_CASCADE_TOTAL_BUDGET_MS = 95_000;
+
+const MIN_TIMEOUT_MS = 50;
+const MAX_TIMEOUT_MS = 150_000;
+const MIN_REMAINING_BUDGET_TO_START_MS = 1_200;
+const PROGRESS_THROTTLE_MS = 750;
+
+// Contadores internos para auditoria de limpeza de recursos (timers, listeners e tentativas ativas)
+let activeAttemptCount = 0;
+let activeTimerCount = 0;
+let activeClientListenerCount = 0;
+
+export interface ActiveCascadeTelemetry {
+  activeAttempts: number;
+  activeTimers: number;
+  activeClientListeners: number;
+}
+
+export function getActiveCascadeTelemetry(): ActiveCascadeTelemetry {
+  return {
+    activeAttempts: activeAttemptCount,
+    activeTimers: activeTimerCount,
+    activeClientListeners: activeClientListenerCount,
+  };
+}
 
 export function hasConfiguredApiKey(value: string | undefined): value is string {
   if (!value) return false;
@@ -69,6 +109,13 @@ function parseTimeoutEnv(envValue: string | undefined, fallbackMs: number): numb
   return Math.min(MAX_TIMEOUT_MS, parsed);
 }
 
+export function getCascadeTotalBudgetMs(): number {
+  return parseTimeoutEnv(
+    process.env.CASCADE_TOTAL_BUDGET_MS,
+    DEFAULT_CASCADE_TOTAL_BUDGET_MS
+  );
+}
+
 export interface ProviderRuntimeConfig {
   provider: AIProviderId;
   label: string;
@@ -78,59 +125,144 @@ export interface ProviderRuntimeConfig {
   configured: boolean;
 }
 
+/**
+ * Detecta se um valor parece ser uma chave/token de API colado por engano em variável de nome de modelo.
+ */
+function isLikelySecretToken(value: string | undefined): boolean {
+  if (!value) return false;
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (/^(AIza|AQ\.|sk-|nvapi-|gsk_|hf_|Bearer\s)/i.test(trimmed)) {
+    return true;
+  }
+  if (
+    trimmed.length >= 36 &&
+    !trimmed.includes("/") &&
+    !/^(?:models\/)?gemini-/i.test(trimmed)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Valida estritamente o identificador do modelo configurado via env, ignorando placeholders ou chaves coladas por engano.
+ */
+export function resolveValidModelId(
+  envValue: string | undefined,
+  defaultModel: string,
+  provider: AIProviderId
+): string {
+  if (!envValue) return defaultModel;
+  const trimmed = envValue.trim();
+  if (
+    !trimmed ||
+    trimmed.startsWith("MY_") ||
+    trimmed === "YOUR_API_KEY" ||
+    trimmed === "PLACEHOLDER" ||
+    isLikelySecretToken(trimmed) ||
+    /\s/.test(trimmed)
+  ) {
+    return defaultModel;
+  }
+
+  if (provider === "gemini") {
+    return /^(?:models\/)?gemini-[a-z0-9.-]+$/i.test(trimmed)
+      ? trimmed
+      : defaultModel;
+  }
+
+  // OpenRouter e NVIDIA NIM utilizam slugs no formato "vendor/model-name"
+  return /^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._:-]*$/i.test(trimmed)
+    ? trimmed
+    : defaultModel;
+}
+
+function getEffectiveOpenRouterKey(): string {
+  if (hasConfiguredApiKey(process.env.OPENROUTER_API_KEY)) {
+    return process.env.OPENROUTER_API_KEY.trim();
+  }
+  if (
+    process.env.OPENROUTER_MODEL &&
+    /^sk-or-/i.test(process.env.OPENROUTER_MODEL.trim())
+  ) {
+    return process.env.OPENROUTER_MODEL.trim();
+  }
+  return "";
+}
+
+function getEffectiveNvidiaKey(): string {
+  if (hasConfiguredApiKey(process.env.NVIDIA_API_KEY)) {
+    return process.env.NVIDIA_API_KEY.trim();
+  }
+  if (
+    process.env.NVIDIA_MODEL &&
+    /^nvapi-/i.test(process.env.NVIDIA_MODEL.trim())
+  ) {
+    return process.env.NVIDIA_MODEL.trim();
+  }
+  return "";
+}
+
 export function getProviderConfigs(
-  mode: "html" | "json" = "html"
+  _mode: "html" | "json" = "html"
 ): Record<AIProviderId, ProviderRuntimeConfig> {
   refreshEnvFromDotenvFile();
 
-  const geminiDefault = mode === "html" ? 75_000 : 55_000;
-  const openrouterDefault = mode === "html" ? 60_000 : 45_000;
-  const nvidiaDefault = mode === "html" ? 60_000 : 45_000;
-
   const geminiTimeoutMs = parseTimeoutEnv(
     process.env.GEMINI_TIMEOUT_MS,
-    geminiDefault
+    DEFAULT_GEMINI_TIMEOUT_MS
   );
   const openrouterTimeoutMs = parseTimeoutEnv(
     process.env.OPENROUTER_TIMEOUT_MS,
-    openrouterDefault
+    DEFAULT_OPENROUTER_TIMEOUT_MS
   );
   const nvidiaTimeoutMs = parseTimeoutEnv(
     process.env.NVIDIA_TIMEOUT_MS,
-    nvidiaDefault
+    DEFAULT_NVIDIA_TIMEOUT_MS
   );
 
   const geminiConfigured =
     hasConfiguredApiKey(process.env.GEMINI_API_KEY2) ||
     hasConfiguredApiKey(process.env.GEMINI_API_KEY);
-  const openrouterConfigured = hasConfiguredApiKey(
-    process.env.OPENROUTER_API_KEY
-  );
-  const nvidiaConfigured = hasConfiguredApiKey(process.env.NVIDIA_API_KEY);
+  const openrouterConfigured = Boolean(getEffectiveOpenRouterKey());
+  const nvidiaConfigured = Boolean(getEffectiveNvidiaKey());
 
   return {
     gemini: {
       provider: "gemini",
       label: "Google Gemini",
-      model: (process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL).trim(),
+      model: resolveValidModelId(
+        process.env.GEMINI_MODEL,
+        DEFAULT_GEMINI_MODEL,
+        "gemini"
+      ),
       timeoutMs: geminiTimeoutMs,
-      inactivityTimeoutMs: Math.min(geminiTimeoutMs, 35_000),
+      inactivityTimeoutMs: Math.min(geminiTimeoutMs, 20_000),
       configured: geminiConfigured,
     },
     openrouter: {
       provider: "openrouter",
       label: "OpenRouter",
-      model: (process.env.OPENROUTER_MODEL || DEFAULT_OPENROUTER_MODEL).trim(),
+      model: resolveValidModelId(
+        process.env.OPENROUTER_MODEL,
+        DEFAULT_OPENROUTER_MODEL,
+        "openrouter"
+      ),
       timeoutMs: openrouterTimeoutMs,
-      inactivityTimeoutMs: Math.min(openrouterTimeoutMs, 28_000),
+      inactivityTimeoutMs: Math.min(openrouterTimeoutMs, 18_000),
       configured: openrouterConfigured,
     },
     nvidia: {
       provider: "nvidia",
       label: "NVIDIA NIM",
-      model: (process.env.NVIDIA_MODEL || DEFAULT_NVIDIA_MODEL).trim(),
+      model: resolveValidModelId(
+        process.env.NVIDIA_MODEL,
+        DEFAULT_NVIDIA_MODEL,
+        "nvidia"
+      ),
       timeoutMs: nvidiaTimeoutMs,
-      inactivityTimeoutMs: Math.min(nvidiaTimeoutMs, 28_000),
+      inactivityTimeoutMs: Math.min(nvidiaTimeoutMs, 18_000),
       configured: nvidiaConfigured,
     },
   };
@@ -148,6 +280,15 @@ export function sanitizeDiagnosticText(raw: string): string {
     process.env.GEMINI_API_KEY2,
     process.env.OPENROUTER_API_KEY,
     process.env.NVIDIA_API_KEY,
+    isLikelySecretToken(process.env.GEMINI_MODEL)
+      ? process.env.GEMINI_MODEL
+      : undefined,
+    isLikelySecretToken(process.env.OPENROUTER_MODEL)
+      ? process.env.OPENROUTER_MODEL
+      : undefined,
+    isLikelySecretToken(process.env.NVIDIA_MODEL)
+      ? process.env.NVIDIA_MODEL
+      : undefined,
   ];
   for (const secret of secretCandidates) {
     if (secret && secret.trim().length >= 8) {
@@ -158,6 +299,7 @@ export function sanitizeDiagnosticText(raw: string): string {
   sanitized = sanitized
     .replace(/Bearer\s+[A-Za-z0-9._\-+/=]+/gi, "Bearer [REDACTED]")
     .replace(/AIza[0-9A-Za-z\-_]{20,}/g, "[REDACTED_GEMINI_KEY]")
+    .replace(/AQ\.[0-9A-Za-z\-_.]{12,}/g, "[REDACTED_GOOGLE_KEY]")
     .replace(/sk-or-v1-[0-9A-Za-z\-_]{16,}/g, "[REDACTED_OR_KEY]")
     .replace(/nvapi-[0-9A-Za-z\-_]{16,}/g, "[REDACTED_NV_KEY]")
     .replace(/([?&]key=)[^&\s]+/gi, "$1[REDACTED]");
@@ -288,19 +430,24 @@ export function classifyProviderError(
   const cleanMsg = sanitizeDiagnosticText(rawMsg);
   const lower = cleanMsg.toLowerCase();
 
-  // Extrai status HTTP se presente no objeto ou na mensagem
   let httpStatus: number | null = null;
   if (err && typeof err === "object") {
     const maybeStatus =
       (err as { status?: unknown }).status ??
       (err as { statusCode?: unknown }).statusCode ??
       (err as { httpStatus?: unknown }).httpStatus;
-    if (typeof maybeStatus === "number" && maybeStatus >= 100 && maybeStatus <= 599) {
+    if (
+      typeof maybeStatus === "number" &&
+      maybeStatus >= 100 &&
+      maybeStatus <= 599
+    ) {
       httpStatus = maybeStatus;
     }
   }
   if (httpStatus === null) {
-    const statusMatch = cleanMsg.match(/\b(?:HTTP|status|code)\s*[:=]?\s*(4\d\d|5\d\d)\b/i);
+    const statusMatch = cleanMsg.match(
+      /\b(?:HTTP|status|code)\s*[:=]?\s*(4\d\d|5\d\d)\b/i
+    );
     if (statusMatch && statusMatch[1]) {
       httpStatus = Number.parseInt(statusMatch[1], 10);
     }
@@ -400,19 +547,24 @@ export function classifyProviderError(
 }
 
 /**
- * Executa uma chamada assíncrona com AbortController 100% independente por tentativa,
- * watchdog de inatividade de stream, e propagação limpa de cancelamento do cliente.
+ * Executa uma tentativa assíncrona com:
+ * - `Promise.race()` explícito (encerra imediatamente a Promise mesmo se a biblioteca ignorar o `AbortSignal`)
+ * - `AbortController` 100% independente por tentativa
+ * - Proteção `isSettled` contra resolução/rejeição tardia de tentativas já encerradas
+ * - Limpeza determinística de todos os timers e listeners em `finally`
  */
-async function runWithAttemptTimeout<T>(options: {
+export async function runWithAttemptTimeout<T>(options: {
   totalTimeoutMs: number;
   inactivityTimeoutMs: number;
   clientSignal?: AbortSignal;
   executor: (
     signal: AbortSignal,
-    notifyActivity: () => void
+    notifyActivity: (receivedCharsDelta?: number) => void,
+    isAttemptSettled: () => boolean
   ) => Promise<T>;
 }): Promise<T> {
-  const { totalTimeoutMs, inactivityTimeoutMs, clientSignal, executor } = options;
+  const { totalTimeoutMs, inactivityTimeoutMs, clientSignal, executor } =
+    options;
 
   if (clientSignal?.aborted) {
     throw new ProviderCallError(
@@ -423,68 +575,139 @@ async function runWithAttemptTimeout<T>(options: {
   }
 
   const attemptController = new AbortController();
-  let abortReason: "timeout" | "cancelled" | null = null;
+  let settled = false;
+  let totalTimer: ReturnType<typeof setTimeout> | null = null;
+  let inactivityTimer: ReturnType<typeof setTimeout> | null = null;
+  let clientListenerAttached = false;
 
-  const totalTimer = setTimeout(() => {
-    if (!attemptController.signal.aborted) {
-      abortReason = "timeout";
-      attemptController.abort(new Error("PROVIDER_TOTAL_TIMEOUT"));
+  const isAttemptSettled = () => settled || attemptController.signal.aborted;
+
+  const clearAttemptTimers = () => {
+    if (totalTimer !== null) {
+      clearTimeout(totalTimer);
+      totalTimer = null;
+      activeTimerCount = Math.max(0, activeTimerCount - 1);
     }
-  }, totalTimeoutMs);
-
-  let inactivityTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-    if (!attemptController.signal.aborted) {
-      abortReason = "timeout";
-      attemptController.abort(new Error("PROVIDER_INACTIVITY_TIMEOUT"));
-    }
-  }, inactivityTimeoutMs);
-
-  const notifyActivity = () => {
-    if (attemptController.signal.aborted) return;
-    if (inactivityTimer) {
+    if (inactivityTimer !== null) {
       clearTimeout(inactivityTimer);
+      inactivityTimer = null;
+      activeTimerCount = Math.max(0, activeTimerCount - 1);
+    }
+  };
+
+  let triggerInterrupt: ((err: ProviderCallError) => void) | null = null;
+
+  const armInactivityTimer = () => {
+    if (settled || attemptController.signal.aborted) return;
+    if (inactivityTimer !== null) {
+      clearTimeout(inactivityTimer);
+      inactivityTimer = null;
+      activeTimerCount = Math.max(0, activeTimerCount - 1);
     }
     inactivityTimer = setTimeout(() => {
-      if (!attemptController.signal.aborted) {
-        abortReason = "timeout";
-        attemptController.abort(new Error("PROVIDER_STREAM_STALL_TIMEOUT"));
-      }
-    }, inactivityTimeoutMs);
-  };
-
-  const onClientAbort = () => {
-    if (!attemptController.signal.aborted) {
-      abortReason = "cancelled";
-      attemptController.abort(new Error("CLIENT_CANCELLED"));
-    }
-  };
-
-  clientSignal?.addEventListener("abort", onClientAbort, { once: true });
-
-  try {
-    return await executor(attemptController.signal, notifyActivity);
-  } catch (err) {
-    if (abortReason === "cancelled" || clientSignal?.aborted) {
-      throw new ProviderCallError(
-        "Operação cancelada pelo usuário.",
-        "cancelled",
-        499
-      );
-    }
-    if (abortReason === "timeout") {
-      throw new ProviderCallError(
-        `Tempo limite excedido (${totalTimeoutMs}ms máx / ${inactivityTimeoutMs}ms inatividade).`,
+      if (settled) return;
+      const err = new ProviderCallError(
+        `Tempo limite de inatividade excedido (${inactivityTimeoutMs}ms sem resposta).`,
         "timeout",
         504
       );
-    }
-    throw err;
+      triggerInterrupt?.(err);
+    }, inactivityTimeoutMs);
+    activeTimerCount++;
+  };
+
+  const safeNotifyActivity = () => {
+    if (settled || attemptController.signal.aborted) return;
+    armInactivityTimer();
+  };
+
+  const onClientAbort = () => {
+    if (settled) return;
+    const err = new ProviderCallError(
+      "Operação cancelada pelo usuário.",
+      "cancelled",
+      499
+    );
+    triggerInterrupt?.(err);
+  };
+
+  const interruptPromise = new Promise<never>((_resolve, reject) => {
+    triggerInterrupt = (err: ProviderCallError) => {
+      if (settled) return;
+      settled = true;
+      clearAttemptTimers();
+      if (!attemptController.signal.aborted) {
+        try {
+          attemptController.abort(err);
+        } catch {
+          // Ignora falhas ao sinalizar abort em controladores já abortados
+        }
+      }
+      reject(err);
+    };
+  });
+
+  totalTimer = setTimeout(() => {
+    if (settled) return;
+    const err = new ProviderCallError(
+      `Tempo limite excedido (${totalTimeoutMs}ms máx).`,
+      "timeout",
+      504
+    );
+    triggerInterrupt?.(err);
+  }, totalTimeoutMs);
+  activeTimerCount++;
+
+  armInactivityTimer();
+
+  if (clientSignal) {
+    clientSignal.addEventListener("abort", onClientAbort, { once: true });
+    clientListenerAttached = true;
+    activeClientListenerCount++;
+  }
+
+  activeAttemptCount++;
+
+  // Executa a operação protegendo contra rejeição não-tratada tardia caso o Promise.race encerre primeiro
+  const guardedExecutorPromise = new Promise<T>((resolve, reject) => {
+    Promise.resolve()
+      .then(() =>
+        executor(attemptController.signal, safeNotifyActivity, isAttemptSettled)
+      )
+      .then(
+        (val) => {
+          // Se o timeout/cancelamento já encerrou esta tentativa, ignora silenciosamente resolução tardia
+          if (settled) return;
+          settled = true;
+          resolve(val);
+        },
+        (err) => {
+          // Se já encerrado por timeout/cancelamento, absorve rejeição tardia para evitar UnhandledRejection
+          if (settled) return;
+          settled = true;
+          reject(err);
+        }
+      );
+  });
+
+  try {
+    return await Promise.race([guardedExecutorPromise, interruptPromise]);
   } finally {
-    clearTimeout(totalTimer);
-    if (inactivityTimer) {
-      clearTimeout(inactivityTimer);
+    settled = true;
+    clearAttemptTimers();
+    if (clientSignal && clientListenerAttached) {
+      clientSignal.removeEventListener("abort", onClientAbort);
+      clientListenerAttached = false;
+      activeClientListenerCount = Math.max(0, activeClientListenerCount - 1);
     }
-    clientSignal?.removeEventListener("abort", onClientAbort);
+    if (!attemptController.signal.aborted) {
+      try {
+        attemptController.abort();
+      } catch {
+        // noop
+      }
+    }
+    activeAttemptCount = Math.max(0, activeAttemptCount - 1);
   }
 }
 
@@ -525,7 +748,7 @@ function createGeminiClient(apiKey: string): GoogleGenAI {
       headers: {
         "User-Agent": "aistudio-build",
       },
-      // Desativa o p-retry silencioso interno do SDK (que dormia até o abortSignal estourar em 429/503)
+      // Desativa o p-retry interno do SDK para expor 503/429 imediatamente sem travar o orçamento
       retryOptions: {
         attempts: 1,
       },
@@ -548,8 +771,7 @@ function getConfiguredGeminiKeys(): string[] {
 }
 
 /**
- * Chamada Gemini via streaming (`generateContentStream`) para resposta progressiva rápida,
- * evitando timeouts silenciosos em animações complexas.
+ * Chamada Gemini via streaming (`generateContentStream`) com eventos de progresso reais.
  */
 async function callGeminiStreaming(options: {
   apiKey: string;
@@ -561,6 +783,8 @@ async function callGeminiStreaming(options: {
   maxOutputTokens: number;
   signal: AbortSignal;
   notifyActivity: () => void;
+  isSettled: () => boolean;
+  onChunkProgress?: (totalChars: number, activeModel: string, statusNote?: string) => void;
 }): Promise<{ text: string; modelUsed: string }> {
   const {
     apiKey,
@@ -572,6 +796,8 @@ async function callGeminiStreaming(options: {
     maxOutputTokens,
     signal,
     notifyActivity,
+    isSettled,
+    onChunkProgress,
   } = options;
 
   const ai = createGeminiClient(apiKey);
@@ -600,13 +826,16 @@ async function callGeminiStreaming(options: {
 
     notifyActivity();
     const chunks: string[] = [];
+    let totalChars = 0;
     for await (const chunk of stream) {
-      if (signal.aborted) {
+      if (signal.aborted || isSettled()) {
         throw new Error("AbortError: stream aborted");
       }
       notifyActivity();
       if (chunk.text) {
         chunks.push(chunk.text);
+        totalChars += chunk.text.length;
+        onChunkProgress?.(totalChars, targetModel);
       }
     }
     return chunks.join("");
@@ -618,7 +847,13 @@ async function callGeminiStreaming(options: {
   ].filter((m) => m !== model);
 
   let lastErr: unknown = null;
-  for (const candidateModel of [model, ...fallbackModels]) {
+  const candidateChain = [model, ...fallbackModels];
+
+  for (let idx = 0; idx < candidateChain.length; idx++) {
+    const candidateModel = candidateChain[idx];
+    if (signal.aborted || isSettled()) {
+      throw new Error("AbortError: attempt already settled");
+    }
     try {
       const text = await runStreamForModel(candidateModel);
       return { text, modelUsed: candidateModel };
@@ -634,8 +869,19 @@ async function callGeminiStreaming(options: {
         msg.includes("high demand") ||
         msg.includes("overloaded");
 
-      if (!signal.aborted && isModelLevelFailure) {
+      if (
+        !signal.aborted &&
+        !isSettled() &&
+        isModelLevelFailure &&
+        idx + 1 < candidateChain.length
+      ) {
+        const nextModel = candidateChain[idx + 1];
         notifyActivity();
+        onChunkProgress?.(
+          0,
+          nextModel,
+          `Modelo ${candidateModel} sob alta demanda. Alternando para ${nextModel}...`
+        );
         continue;
       }
       throw err;
@@ -646,7 +892,7 @@ async function callGeminiStreaming(options: {
 
 /**
  * Lê um stream SSE OpenAI-compatible (OpenRouter / NVIDIA NIM) ou resposta JSON direta,
- * acumulando `delta.content` e sinalizando atividade a cada pacote recebido.
+ * acumulando `delta.content` e emitindo progresso real.
  */
 async function callOpenAICompatibleStreaming(options: {
   endpoint: string;
@@ -660,6 +906,8 @@ async function callOpenAICompatibleStreaming(options: {
   extraBody?: Record<string, unknown>;
   signal: AbortSignal;
   notifyActivity: () => void;
+  isSettled: () => boolean;
+  onChunkProgress?: (totalChars: number, activeModel: string, statusNote?: string) => void;
 }): Promise<{ text: string; httpStatus: number; resolvedModel: string }> {
   const {
     endpoint,
@@ -673,6 +921,8 @@ async function callOpenAICompatibleStreaming(options: {
     extraBody,
     signal,
     notifyActivity,
+    isSettled,
+    onChunkProgress,
   } = options;
 
   const executeFetch = async (
@@ -705,8 +955,14 @@ async function callOpenAICompatibleStreaming(options: {
 
   let response = await executeFetch(extraBody);
 
-  // Caso um sub-provedor do OpenRouter/NVIDIA rejeite parâmetros opcionais (HTTP 400), refaz enxuto imediatamente
-  if (!response.ok && response.status === 400 && extraBody && !signal.aborted) {
+  // Caso um sub-provedor rejeite parâmetros opcionais (HTTP 400), refaz enxuto imediatamente
+  if (
+    !response.ok &&
+    response.status === 400 &&
+    extraBody &&
+    !signal.aborted &&
+    !isSettled()
+  ) {
     notifyActivity();
     response = await executeFetch(undefined);
   }
@@ -716,7 +972,9 @@ async function callOpenAICompatibleStreaming(options: {
   if (!response.ok) {
     const errBody = await response.text().catch(() => "");
     const classified = classifyProviderError(
-      new Error(`${providerLabel} HTTP ${response.status}: ${errBody.slice(0, 260)}`)
+      new Error(
+        `${providerLabel} HTTP ${response.status}: ${errBody.slice(0, 260)}`
+      )
     );
     throw new ProviderCallError(
       `${providerLabel} HTTP ${response.status}: ${errBody.slice(0, 220)}`,
@@ -727,7 +985,6 @@ async function callOpenAICompatibleStreaming(options: {
 
   const contentType = (response.headers.get("content-type") || "").toLowerCase();
 
-  // Caso o endpoint responda JSON direto (não-SSE)
   if (contentType.includes("application/json")) {
     const data = (await response.json()) as {
       model?: string;
@@ -746,14 +1003,17 @@ async function callOpenAICompatibleStreaming(options: {
       );
     }
     const content = data.choices?.[0]?.message?.content ?? "";
+    const resolved = data.model || model;
+    if (content.length > 0) {
+      onChunkProgress?.(content.length, resolved);
+    }
     return {
       text: content,
       httpStatus: response.status,
-      resolvedModel: data.model || model,
+      resolvedModel: resolved,
     };
   }
 
-  // Leitura progressiva de Server-Sent Events (SSE)
   if (!response.body) {
     throw new ProviderCallError(
       `${providerLabel} retornou corpo de stream vazio.`,
@@ -767,9 +1027,14 @@ async function callOpenAICompatibleStreaming(options: {
   let buffer = "";
   let resolvedModel = model;
   const contentParts: string[] = [];
+  let totalChars = 0;
 
   try {
     while (true) {
+      if (signal.aborted || isSettled()) {
+        await reader.cancel().catch(() => {});
+        throw new Error("AbortError: SSE reader cancelled");
+      }
       const { done, value } = await reader.read();
       if (done) break;
       notifyActivity();
@@ -809,12 +1074,13 @@ async function callOpenAICompatibleStreaming(options: {
             parsed.choices?.[0]?.message?.content;
           if (typeof piece === "string" && piece.length > 0) {
             contentParts.push(piece);
+            totalChars += piece.length;
+            onChunkProgress?.(totalChars, resolvedModel);
           }
         } catch (parseErr) {
           if (parseErr instanceof ProviderCallError) {
             throw parseErr;
           }
-          // Ignora linhas SSE parciais/comentários não-JSON
         }
       }
     }
@@ -830,11 +1096,12 @@ async function callOpenAICompatibleStreaming(options: {
 }
 
 /**
- * Injeção controlada de falhas APENAS para suíte de verificação automatizada local (testes 5 a 9).
+ * Injeção controlada de falhas APENAS para verificação automatizada local (loopback dev).
  */
 export interface ProviderSimulationFault {
   action?:
     | "timeout"
+    | "ignore_abort_timeout"
     | "auth_error"
     | "rate_limit"
     | "provider_unavailable"
@@ -852,6 +1119,7 @@ export type CascadeSimulationMap = Partial<
 export interface ExecuteCascadeOptions<T> {
   operation: string;
   mode: "html" | "json";
+  initialStageMessage?: string;
   systemInstruction: string;
   userPrompt: string;
   jsonFallbackReminder?: string;
@@ -859,6 +1127,7 @@ export interface ExecuteCascadeOptions<T> {
   maxOutputTokens?: number;
   validateAndTransform: (rawText: string, provider: AIProviderId) => T;
   clientSignal?: AbortSignal;
+  onProgressEvent?: (event: StreamProgressEvent) => void;
   simulationFaults?: CascadeSimulationMap;
 }
 
@@ -872,31 +1141,50 @@ async function applySimulationFaultIfPresent(
   provider: AIProviderId,
   fault: ProviderSimulationFault | undefined,
   signal: AbortSignal,
-  notifyActivity: () => void
+  notifyActivity: () => void,
+  onChunkProgress?: (totalChars: number, activeModel: string, statusNote?: string) => void
 ): Promise<string | null> {
   if (!fault || !fault.action) return null;
 
-  if (fault.delayMs && fault.delayMs > 0) {
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => resolve(), fault.delayMs);
-      const onAbort = () => {
-        clearTimeout(timer);
-        reject(new Error("AbortError: aborted during simulated delay"));
-      };
-      if (signal.aborted) {
-        clearTimeout(timer);
-        reject(new Error("AbortError: already aborted"));
-        return;
-      }
-      signal.addEventListener("abort", onAbort, { once: true });
+  // Caso especial para Teste #3: operação que IGNORA completamente o AbortSignal
+  if (fault.action === "ignore_abort_timeout") {
+    await new Promise<void>(() => {
+      // Intencionalmente nunca resolve nem escuta `signal` para comprovar o Promise.race()
     });
+    return null;
+  }
+
+  if (fault.delayMs && fault.delayMs > 0) {
+    // Emite batimentos intermediários durante delays simulados longos (Teste #2) para manter o fluxo vivo
+    const sliceMs = 350;
+    let remaining = fault.delayMs;
+    let simulatedChars = 0;
+    while (remaining > 0) {
+      const wait = Math.min(sliceMs, remaining);
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => resolve(), wait);
+        const onAbort = () => {
+          clearTimeout(timer);
+          reject(new Error("AbortError: aborted during simulated delay"));
+        };
+        if (signal.aborted) {
+          clearTimeout(timer);
+          reject(new Error("AbortError: already aborted"));
+          return;
+        }
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+      remaining -= wait;
+      notifyActivity();
+      simulatedChars += 512;
+      onChunkProgress?.(simulatedChars, `${provider}-simulated`);
+    }
   }
 
   notifyActivity();
 
   switch (fault.action) {
     case "timeout":
-      // Aguarda até que o AbortController independente da tentativa dispare o timeout real
       await new Promise<void>((_resolve, reject) => {
         const onAbort = () =>
           reject(new Error("AbortError: simulated provider hang timed out"));
@@ -958,12 +1246,16 @@ window.seek(0);
   }
 }
 
+function getOperationActionVerb(operation: string): string {
+  if (operation.includes("plan")) return "Planejando direção de arte e storyboard";
+  if (operation.includes("regenerate")) return "Regenerando cena selecionada";
+  if (operation.includes("render")) return "Renderizando storyboard aprovado";
+  return "Gerando animação";
+}
+
 /**
- * Motor unificado de Cascata de Provedores:
+ * Motor unificado de Cascata de Provedores com Orçamento Global Previsível e Eventos SSE em Tempo Real:
  * Ordem estrita: 1. Gemini -> 2. OpenRouter -> 3. NVIDIA NIM
- * - AbortController e temporizadores independentes por tentativa (limpos em finally)
- * - Preservação integral dos erros de cada provedor
- * - Respeito imediato ao cancelamento do cliente (não dispara fallbacks após cancelamento)
  */
 export async function executeProviderCascade<T>(
   options: ExecuteCascadeOptions<T>
@@ -971,6 +1263,7 @@ export async function executeProviderCascade<T>(
   const {
     operation,
     mode,
+    initialStageMessage,
     systemInstruction,
     userPrompt,
     jsonFallbackReminder,
@@ -978,20 +1271,48 @@ export async function executeProviderCascade<T>(
     maxOutputTokens = mode === "html" ? 16384 : 8192,
     validateAndTransform,
     clientSignal,
+    onProgressEvent,
     simulationFaults,
   } = options;
 
   const generationId = createStableId("gen");
   const configs = getProviderConfigs(mode);
+  const totalCascadeBudgetMs = getCascadeTotalBudgetMs();
+  const cascadeDeadlineMs = Date.now() + totalCascadeBudgetMs;
+
   const attempts: ProviderAttemptDiagnostic[] = [];
   const providerOrder: AIProviderId[] = ["gemini", "openrouter", "nvidia"];
+
+  const emitProgress = (
+    partial: Omit<StreamProgressEvent, "generationId" | "operation" | "timestamp">
+  ) => {
+    if (!onProgressEvent) return;
+    try {
+      onProgressEvent({
+        generationId,
+        operation,
+        timestamp: new Date().toISOString(),
+        ...partial,
+      });
+    } catch {
+      // Nunca permite que erro de callback de UI interrompa o pipeline
+    }
+  };
+
+  emitProgress({
+    type: "generation_started",
+    message:
+      initialStageMessage ||
+      (mode === "json"
+        ? "Analisando roteiro e planejando direção de arte..."
+        : "Analisando roteiro e preparando composição..."),
+  });
 
   for (let idx = 0; idx < providerOrder.length; idx++) {
     const providerId = providerOrder[idx];
     const cfg = configs[providerId];
     const fault = simulationFaults?.[providerId];
 
-    // Se o cliente já cancelou, interrompe imediatamente sem tentar próximos provedores
     if (clientSignal?.aborted) {
       const nowIso = new Date().toISOString();
       const cancelDiag: ProviderAttemptDiagnostic = {
@@ -1008,6 +1329,12 @@ export async function executeProviderCascade<T>(
         userMessage: getUserFriendlyMessageForErrorType("cancelled"),
       };
       attempts.push(cancelDiag);
+      emitProgress({
+        type: "generation_cancelled",
+        provider: providerId,
+        providerLabel: cfg.label,
+        message: "Geração cancelada pelo usuário.",
+      });
       throw new CascadeExecutionError({
         message: getUserFriendlyMessageForErrorType("cancelled"),
         generationId,
@@ -1019,7 +1346,6 @@ export async function executeProviderCascade<T>(
       });
     }
 
-    // Verifica disponibilidade de credencial (a menos que em modo de simulação explícita de teste)
     if (!cfg.configured && !fault) {
       const nowIso = new Date().toISOString();
       const skippedDiag: ProviderAttemptDiagnostic = {
@@ -1040,26 +1366,121 @@ export async function executeProviderCascade<T>(
       continue;
     }
 
+    // Verifica orçamento global restante antes de iniciar a tentativa
+    const remainingBudgetMs = cascadeDeadlineMs - Date.now();
+    if (remainingBudgetMs < MIN_REMAINING_BUDGET_TO_START_MS) {
+      const nowIso = new Date().toISOString();
+      const budgetDiag: ProviderAttemptDiagnostic = {
+        provider: providerId,
+        providerLabel: cfg.label,
+        model: cfg.model,
+        startedAt: nowIso,
+        endedAt: nowIso,
+        durationMs: 0,
+        httpStatus: 504,
+        outcome: "failed",
+        errorType: "timeout",
+        failureReason: `Orçamento total da cascata (${totalCascadeBudgetMs}ms) esgotado antes de iniciar ${cfg.label}.`,
+        userMessage: getUserFriendlyMessageForErrorType("timeout"),
+      };
+      attempts.push(budgetDiag);
+      logStructuredAttempt(generationId, operation, idx + 1, budgetDiag);
+      break;
+    }
+
+    // Se já houve falha anterior ejecutada, emite fallback_started explícito
+    const prevExecutedFailure = [...attempts]
+      .reverse()
+      .find((a) => a.outcome === "failed");
+    if (prevExecutedFailure) {
+      emitProgress({
+        type: "fallback_started",
+        provider: providerId,
+        providerLabel: cfg.label,
+        model: cfg.model,
+        attemptNumber: idx + 1,
+        message: `${prevExecutedFailure.providerLabel} indisponível. Tentando ${cfg.label}...`,
+      });
+    }
+
     const attemptStartMs = Date.now();
     const startedAtIso = new Date(attemptStartMs).toISOString();
-    const effectiveTimeoutMs = fault?.timeoutOverrideMs ?? cfg.timeoutMs;
+    const configuredAttemptTimeoutMs = fault?.timeoutOverrideMs ?? cfg.timeoutMs;
+    const effectiveTimeoutMs = Math.max(
+      MIN_TIMEOUT_MS,
+      Math.min(configuredAttemptTimeoutMs, remainingBudgetMs)
+    );
     const effectiveInactivityMs = fault?.timeoutOverrideMs
-      ? fault.timeoutOverrideMs
-      : cfg.inactivityTimeoutMs;
+      ? effectiveTimeoutMs
+      : Math.min(cfg.inactivityTimeoutMs, effectiveTimeoutMs);
 
     let resolvedModelName = cfg.model;
+
+    emitProgress({
+      type: "provider_started",
+      provider: providerId,
+      providerLabel: cfg.label,
+      model: cfg.model,
+      attemptNumber: idx + 1,
+      message: `Conectando ao ${cfg.label} (${cfg.model})...`,
+    });
+
+    let lastProgressEmitMs = 0;
+    let firstChunkAnnounced = false;
+    const actionVerb = getOperationActionVerb(operation);
+
+    const handleChunkProgress = (
+      totalChars: number,
+      activeModel: string,
+      statusNote?: string
+    ) => {
+      resolvedModelName = activeModel;
+      if (statusNote) {
+        emitProgress({
+          type: "provider_progress",
+          provider: providerId,
+          providerLabel: cfg.label,
+          model: activeModel,
+          attemptNumber: idx + 1,
+          receivedChars: totalChars,
+          message: statusNote,
+        });
+        lastProgressEmitMs = Date.now();
+        return;
+      }
+
+      const now = Date.now();
+      if (!firstChunkAnnounced || now - lastProgressEmitMs >= PROGRESS_THROTTLE_MS) {
+        firstChunkAnnounced = true;
+        lastProgressEmitMs = now;
+        const kbLabel =
+          totalChars >= 1024
+            ? ` (${(totalChars / 1024).toFixed(1).replace(".", ",")} KB recebidos)`
+            : "";
+        emitProgress({
+          type: "provider_progress",
+          provider: providerId,
+          providerLabel: cfg.label,
+          model: activeModel,
+          attemptNumber: idx + 1,
+          receivedChars: totalChars,
+          message: `${actionVerb} via ${cfg.label}${kbLabel}...`,
+        });
+      }
+    };
 
     try {
       const rawOutput = await runWithAttemptTimeout<string>({
         totalTimeoutMs: effectiveTimeoutMs,
         inactivityTimeoutMs: effectiveInactivityMs,
         clientSignal,
-        executor: async (signal, notifyActivity) => {
+        executor: async (signal, notifyActivity, isAttemptSettled) => {
           const simulated = await applySimulationFaultIfPresent(
             providerId,
             fault,
             signal,
-            notifyActivity
+            notifyActivity,
+            handleChunkProgress
           );
           if (simulated !== null) {
             return simulated;
@@ -1080,17 +1501,20 @@ export async function executeProviderCascade<T>(
                   maxOutputTokens,
                   signal,
                   notifyActivity,
+                  isSettled: isAttemptSettled,
+                  onChunkProgress: handleChunkProgress,
                 });
-                resolvedModelName = res.modelUsed;
+                if (!isAttemptSettled()) {
+                  resolvedModelName = res.modelUsed;
+                }
                 return res.text;
               } catch (keyErr) {
                 lastKeyErr = keyErr;
                 const check = classifyProviderError(keyErr);
-                // Se existe uma segunda chave Gemini (ex: GEMINI_API_KEY após GEMINI_API_KEY2 falhar com 401/403/429), tenta imediatamente
-                // Só troca de chave se o erro for de credencial (401/403) ou cota da chave (429)
                 const canTrySecondaryKey =
                   kIdx + 1 < geminiKeys.length &&
                   !signal.aborted &&
+                  !isAttemptSettled() &&
                   (check.errorType === "auth_error" ||
                     check.errorType === "rate_limit");
                 if (!canTrySecondaryKey) {
@@ -1109,7 +1533,7 @@ export async function executeProviderCascade<T>(
                 : userPrompt;
             const res = await callOpenAICompatibleStreaming({
               endpoint: OPENROUTER_CHAT_ENDPOINT,
-              apiKey: process.env.OPENROUTER_API_KEY || "",
+              apiKey: getEffectiveOpenRouterKey(),
               model: cfg.model,
               providerLabel: cfg.label,
               systemInstruction,
@@ -1125,8 +1549,12 @@ export async function executeProviderCascade<T>(
               },
               signal,
               notifyActivity,
+              isSettled: isAttemptSettled,
+              onChunkProgress: handleChunkProgress,
             });
-            resolvedModelName = res.resolvedModel;
+            if (!isAttemptSettled()) {
+              resolvedModelName = res.resolvedModel;
+            }
             return res.text;
           }
 
@@ -1135,11 +1563,12 @@ export async function executeProviderCascade<T>(
             mode === "json" && jsonFallbackReminder
               ? `${userPrompt}\n\n${jsonFallbackReminder}`
               : userPrompt;
+          const nvApiKey = getEffectiveNvidiaKey();
           try {
             const isNemotron = cfg.model.includes("nemotron");
             const res = await callOpenAICompatibleStreaming({
               endpoint: NVIDIA_CHAT_ENDPOINT,
-              apiKey: process.env.NVIDIA_API_KEY || "",
+              apiKey: nvApiKey,
               model: cfg.model,
               providerLabel: cfg.label,
               systemInstruction,
@@ -1150,36 +1579,63 @@ export async function executeProviderCascade<T>(
                 : undefined,
               signal,
               notifyActivity,
+              isSettled: isAttemptSettled,
+              onChunkProgress: handleChunkProgress,
             });
-            resolvedModelName = res.resolvedModel;
+            if (!isAttemptSettled()) {
+              resolvedModelName = res.resolvedModel;
+            }
             return res.text;
           } catch (nvPrimaryErr) {
             const check = classifyProviderError(nvPrimaryErr);
             if (
               !signal.aborted &&
+              !isAttemptSettled() &&
               cfg.model !== SECONDARY_NVIDIA_MODEL &&
               (check.errorType === "http_error" ||
                 check.errorType === "provider_unavailable" ||
                 check.errorType === "timeout")
             ) {
               notifyActivity();
+              handleChunkProgress(
+                0,
+                SECONDARY_NVIDIA_MODEL,
+                `Alternando para modelo secundário ${SECONDARY_NVIDIA_MODEL} na NVIDIA NIM...`
+              );
               const res2 = await callOpenAICompatibleStreaming({
                 endpoint: NVIDIA_CHAT_ENDPOINT,
-                apiKey: process.env.NVIDIA_API_KEY || "",
+                apiKey: nvApiKey,
                 model: SECONDARY_NVIDIA_MODEL,
                 providerLabel: cfg.label,
                 systemInstruction,
                 userPrompt: promptToSend,
-                maxTokens: maxOutputTokens,
+                maxTokens: Math.min(maxOutputTokens, 8192),
                 signal,
                 notifyActivity,
+                isSettled: isAttemptSettled,
+                onChunkProgress: handleChunkProgress,
               });
-              resolvedModelName = res2.resolvedModel;
+              if (!isAttemptSettled()) {
+                resolvedModelName = res2.resolvedModel;
+              }
               return res2.text;
             }
             throw nvPrimaryErr;
           }
         },
+      });
+
+      emitProgress({
+        type: "provider_progress",
+        provider: providerId,
+        providerLabel: cfg.label,
+        model: resolvedModelName,
+        attemptNumber: idx + 1,
+        receivedChars: rawOutput?.length ?? 0,
+        message:
+          mode === "html"
+            ? "Validando animação e contrato determinístico window.seek(t)..."
+            : "Validando estrutura do planejamento...",
       });
 
       // Valida o conteúdo ANTES de declarar sucesso (nunca retorna resposta inválida!)
@@ -1230,6 +1686,7 @@ export async function executeProviderCascade<T>(
     } catch (attemptErr) {
       const endedAtMs = Date.now();
       const classified = classifyProviderError(attemptErr);
+      const attemptDurationMs = endedAtMs - attemptStartMs;
 
       const failedDiag: ProviderAttemptDiagnostic = {
         provider: providerId,
@@ -1237,7 +1694,7 @@ export async function executeProviderCascade<T>(
         model: resolvedModelName,
         startedAt: startedAtIso,
         endedAt: new Date(endedAtMs).toISOString(),
-        durationMs: endedAtMs - attemptStartMs,
+        durationMs: attemptDurationMs,
         httpStatus: classified.httpStatus,
         outcome: "failed",
         errorType: classified.errorType,
@@ -1247,8 +1704,15 @@ export async function executeProviderCascade<T>(
       attempts.push(failedDiag);
       logStructuredAttempt(generationId, operation, idx + 1, failedDiag);
 
-      // Se o cancelamento partiu do usuário, não avança para o próximo provedor da cascata
       if (classified.errorType === "cancelled" || clientSignal?.aborted) {
+        emitProgress({
+          type: "generation_cancelled",
+          provider: providerId,
+          providerLabel: cfg.label,
+          model: resolvedModelName,
+          durationMs: attemptDurationMs,
+          message: "Geração cancelada pelo usuário.",
+        });
         throw new CascadeExecutionError({
           message: getUserFriendlyMessageForErrorType("cancelled"),
           generationId,
@@ -1259,15 +1723,24 @@ export async function executeProviderCascade<T>(
           statusCode: 499,
         });
       }
-      // Caso contrário, continua automaticamente para o próximo provedor da cascata!
+
+      emitProgress({
+        type: "provider_failed",
+        provider: providerId,
+        providerLabel: cfg.label,
+        model: resolvedModelName,
+        attemptNumber: idx + 1,
+        errorType: classified.errorType,
+        durationMs: attemptDurationMs,
+        message: `${cfg.label}: ${getUserFriendlyMessageForErrorType(classified.errorType)}`,
+      });
     }
   }
 
-  // Todos os provedores foram tentados (ou pulados por falta de chave) e nenhum teve sucesso
   const executedFailures = attempts.filter((a) => a.outcome === "failed");
 
   if (executedFailures.length === 0) {
-    throw new CascadeExecutionError({
+    const authPayloadErr = new CascadeExecutionError({
       message:
         "Falha na autenticação do provedor. Verifique a configuração da API (nenhuma chave de API ativa foi encontrada no servidor).",
       generationId,
@@ -1277,13 +1750,19 @@ export async function executeProviderCascade<T>(
       retryable: false,
       statusCode: 401,
     });
+    emitProgress({
+      type: "generation_failed",
+      errorType: "auth_error",
+      message: authPayloadErr.message,
+      errorPayload: authPayloadErr.toApiErrorPayload(),
+    });
+    throw authPayloadErr;
   }
 
   const uniqueErrorTypes = new Set(
     executedFailures.map((f) => f.errorType).filter(Boolean)
   );
 
-  // Determina mensagem principal clara e específica em português
   let headlineMessage =
     "Não foi possível gerar a animação. Todos os provedores disponíveis falharam.";
   let primaryErrorType: ProviderErrorType | "all_providers_failed" =
@@ -1313,7 +1792,7 @@ export async function executeProviderCascade<T>(
       "O provedor de IA demorou mais que o esperado para responder. Todos os provedores disponíveis atingiram o tempo limite.";
   }
 
-  throw new CascadeExecutionError({
+  const finalError = new CascadeExecutionError({
     message: headlineMessage,
     generationId,
     operation,
@@ -1322,6 +1801,15 @@ export async function executeProviderCascade<T>(
     retryable,
     statusCode,
   });
+
+  emitProgress({
+    type: "generation_failed",
+    errorType: primaryErrorType,
+    message: headlineMessage,
+    errorPayload: finalError.toApiErrorPayload(),
+  });
+
+  throw finalError;
 }
 
 export interface ProviderHealthReport {
@@ -1373,7 +1861,7 @@ export async function diagnoseProvidersHealth(
       await runWithAttemptTimeout({
         totalTimeoutMs: 18_000,
         inactivityTimeoutMs: 15_000,
-        executor: async (signal, notifyActivity) => {
+        executor: async (signal, notifyActivity, isAttemptSettled) => {
           if (id === "gemini") {
             const keys = getConfiguredGeminiKeys();
             let lastErr: unknown = null;
@@ -1388,6 +1876,7 @@ export async function diagnoseProvidersHealth(
                   maxOutputTokens: 16,
                   signal,
                   notifyActivity,
+                  isSettled: isAttemptSettled,
                 });
                 effectiveModel = res.modelUsed;
                 return;
@@ -1397,6 +1886,7 @@ export async function diagnoseProvidersHealth(
                 if (
                   kIdx + 1 < keys.length &&
                   !signal.aborted &&
+                  !isAttemptSettled() &&
                   (check.errorType === "auth_error" ||
                     check.errorType === "rate_limit")
                 ) {
@@ -1411,7 +1901,7 @@ export async function diagnoseProvidersHealth(
           if (id === "openrouter") {
             const res = await callOpenAICompatibleStreaming({
               endpoint: OPENROUTER_CHAT_ENDPOINT,
-              apiKey: process.env.OPENROUTER_API_KEY || "",
+              apiKey: getEffectiveOpenRouterKey(),
               model: cfg.model,
               providerLabel: cfg.label,
               systemInstruction: "Reply with OK.",
@@ -1427,15 +1917,17 @@ export async function diagnoseProvidersHealth(
               },
               signal,
               notifyActivity,
+              isSettled: isAttemptSettled,
             });
             effectiveModel = res.resolvedModel;
             return;
           }
+          const nvKey = getEffectiveNvidiaKey();
           try {
             const isNemotron = cfg.model.includes("nemotron");
             const res = await callOpenAICompatibleStreaming({
               endpoint: NVIDIA_CHAT_ENDPOINT,
-              apiKey: process.env.NVIDIA_API_KEY || "",
+              apiKey: nvKey,
               model: cfg.model,
               providerLabel: cfg.label,
               systemInstruction: "Reply with OK.",
@@ -1446,14 +1938,19 @@ export async function diagnoseProvidersHealth(
                 : undefined,
               signal,
               notifyActivity,
+              isSettled: isAttemptSettled,
             });
             effectiveModel = res.resolvedModel;
           } catch (nvErr) {
-            if (!signal.aborted && cfg.model !== SECONDARY_NVIDIA_MODEL) {
+            if (
+              !signal.aborted &&
+              !isAttemptSettled() &&
+              cfg.model !== SECONDARY_NVIDIA_MODEL
+            ) {
               notifyActivity();
               const res2 = await callOpenAICompatibleStreaming({
                 endpoint: NVIDIA_CHAT_ENDPOINT,
-                apiKey: process.env.NVIDIA_API_KEY || "",
+                apiKey: nvKey,
                 model: SECONDARY_NVIDIA_MODEL,
                 providerLabel: cfg.label,
                 systemInstruction: "Reply with OK.",
@@ -1461,6 +1958,7 @@ export async function diagnoseProvidersHealth(
                 maxTokens: 16,
                 signal,
                 notifyActivity,
+                isSettled: isAttemptSettled,
               });
               effectiveModel = res2.resolvedModel;
               return;

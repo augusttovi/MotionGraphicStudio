@@ -15,6 +15,7 @@ import type {
   RegenerateSceneResponse,
   RenderTechnology,
   StoryboardScene,
+  StreamProgressEvent,
   StyleId,
 } from "../src/shared/motionStudioContracts.ts";
 import {
@@ -42,6 +43,8 @@ export { hasConfiguredApiKey, refreshEnvFromDotenvFile };
 export interface CascadeRunContext {
   clientSignal?: AbortSignal;
   simulationFaults?: CascadeSimulationMap;
+  onProgressEvent?: (event: StreamProgressEvent) => void;
+  initialStageMessage?: string;
 }
 
 export function extractCleanHtml(rawText: string): string {
@@ -110,10 +113,12 @@ export async function executeHtmlCascade(
   const outcome = await executeProviderCascade<string>({
     operation,
     mode: "html",
+    initialStageMessage: context?.initialStageMessage,
     systemInstruction,
     userPrompt,
     maxOutputTokens: 16384,
     clientSignal: context?.clientSignal,
+    onProgressEvent: context?.onProgressEvent,
     simulationFaults: context?.simulationFaults,
     validateAndTransform: (rawText, providerId) => {
       const html = extractCleanHtml(rawText);
@@ -147,6 +152,7 @@ async function executeJsonCascade<T>(
   const outcome = await executeProviderCascade<T>({
     operation,
     mode: "json",
+    initialStageMessage: context?.initialStageMessage,
     systemInstruction,
     userPrompt,
     jsonFallbackReminder:
@@ -154,6 +160,7 @@ async function executeJsonCascade<T>(
     geminiSchema,
     maxOutputTokens: 8192,
     clientSignal: context?.clientSignal,
+    onProgressEvent: context?.onProgressEvent,
     simulationFaults: context?.simulationFaults,
     validateAndTransform: (rawText) => {
       const cleanJson = extractCleanJsonString(rawText);
@@ -534,7 +541,12 @@ Elabore a Direção de Arte completa e divida o roteiro em cenas organizadas e c
       return project;
     },
     "storyboard_plan",
-    context
+    {
+      ...context,
+      initialStageMessage:
+        context?.initialStageMessage ??
+        "Analisando roteiro e planejando direção de arte...",
+    }
   );
 
   return {
@@ -674,7 +686,12 @@ SOLICITAÇÃO DO USUÁRIO PARA A REGENERAÇÃO:
       return { updatedScene, notes };
     },
     "storyboard_regenerate_scene",
-    context
+    {
+      ...context,
+      initialStageMessage:
+        context?.initialStageMessage ??
+        "Analisando cenas vizinhas e regenerando cena selecionada...",
+    }
   );
 
   // Atualiza apenas a cena alvo, mantendo intactas todas as outras cenas aprovadas
@@ -780,7 +797,12 @@ Preservando todos os textos obrigatórios, dados e intenção narrativa do rotei
     systemInstruction,
     userPrompt,
     "direct_generate",
-    context
+    {
+      ...context,
+      initialStageMessage:
+        context?.initialStageMessage ??
+        "Analisando roteiro e definindo direção de arte...",
+    }
   );
 
   return {
@@ -888,7 +910,12 @@ Gere agora APENAS o código \`<!DOCTYPE html>\` completo e determinístico (\`wi
     systemInstruction,
     userPrompt,
     "storyboard_render",
-    context
+    {
+      ...context,
+      initialStageMessage:
+        context?.initialStageMessage ??
+        "Preparando storyboard aprovado para renderização determinística...",
+    }
   );
 
   return {
