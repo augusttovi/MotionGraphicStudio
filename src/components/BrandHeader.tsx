@@ -102,7 +102,13 @@ export function BrandHeader() {
             href="#roteiro"
             className="hover:text-white hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
           >
-            Roteiro
+            Roteiro & Modos
+          </a>
+          <a
+            href="#storyboard"
+            className="hover:text-white hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
+          >
+            Storyboard
           </a>
           <a
             href="#preview"
@@ -120,7 +126,7 @@ export function BrandHeader() {
             href="#identidade"
             className="hover:text-white hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
           >
-            Identidade Visual
+            Estilos & Motor
           </a>
         </nav>
 

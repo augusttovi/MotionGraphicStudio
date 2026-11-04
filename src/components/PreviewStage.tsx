@@ -8,6 +8,9 @@ interface PreviewStageProps {
   isGenerating: boolean;
   elapsedSeconds: number;
   estimatedVideoDuration: number | null;
+  externalSeekRequest?: { time: number; nonce: number } | null;
+  loadingLabel?: string;
+  loadingSubtitle?: string;
 }
 
 function formatTimecode(seconds: number): string {
@@ -49,6 +52,9 @@ export function PreviewStage({
   isGenerating,
   elapsedSeconds,
   estimatedVideoDuration,
+  externalSeekRequest,
+  loadingLabel,
+  loadingSubtitle,
 }: PreviewStageProps) {
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const stageWrapperRef = useRef<HTMLDivElement | null>(null);
@@ -141,6 +147,15 @@ export function PreviewStage({
     }
   }, []);
 
+  useEffect(() => {
+    if (!externalSeekRequest || !generatedHtml || isGenerating) return;
+    const target = Math.max(0, externalSeekRequest.time);
+    setCurrentTime(target);
+    setIsPlaying(false);
+    postToIframe({ type: "MALASOMBRE_CMD_PAUSE" });
+    postToIframe({ type: "MALASOMBRE_CMD_SEEK", time: target });
+  }, [externalSeekRequest, generatedHtml, isGenerating, postToIframe]);
+
   const handleTogglePlay = () => {
     if (!generatedHtml) return;
     const directDuration = readWindowDuration(iframeRef.current?.contentWindow);
@@ -231,11 +246,11 @@ export function PreviewStage({
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-[radial-gradient(circle_at_center,#2a0033_0%,#000000_72%)] px-6 text-center">
             <div className="w-12 h-12 rounded-full border-2 border-[#8a2be2]/30 border-t-[#8a2be2] animate-spin mb-5" />
             <p className="font-display text-xl sm:text-2xl tracking-wide uppercase text-white">
-              Compondo Cena Determinística
+              {loadingLabel || "Renderizando Motion Graphic Determinístico"}
             </p>
             <p className="mt-2 text-sm text-[#c5b8d8] max-w-lg leading-relaxed">
-              Mapeando a timeline completa do roteiro para a função{" "}
-              <code className="font-mono text-[#c490ff]">window.seek(t)</code> em 16:9...
+              {loadingSubtitle ||
+                "Sincronizando direção criativa, cenas e função window.seek(t) em 1920×1080..."}
             </p>
 
             <div className="mt-5 space-y-1.5 text-xs font-mono tabular-nums">

@@ -3,143 +3,39 @@ import express from "express";
 import type { NextFunction, Request, Response } from "express";
 import fs from "node:fs";
 import path from "node:path";
-import { GoogleGenAI, ThinkingLevel } from "@google/genai";
+import type {
+  ApiErrorPayload,
+  DirectGenerateRequest,
+  PlanStoryboardRequest,
+  ProjectContextMemory,
+  RegenerateSceneRequest,
+  RenderStoryboardRequest,
+} from "./src/shared/motionStudioContracts.ts";
+import {
+  MOTION_STYLE_LIBRARY,
+  STYLE_CATEGORIES,
+} from "./src/shared/styleLibrary.ts";
+import {
+  generateDirectMotionWithAI,
+  planStoryboardWithAI,
+  regenerateSceneWithAI,
+  renderApprovedStoryboardWithAI,
+} from "./server/creativePipeline.ts";
+import type { CascadeRunContext } from "./server/creativePipeline.ts";
+import {
+  CascadeExecutionError,
+  diagnoseProvidersHealth,
+  sanitizeDiagnosticText,
+} from "./server/providerCascade.ts";
+import type { CascadeSimulationMap } from "./server/providerCascade.ts";
 
 dotenv.config();
 
 const PORT = 3000;
 const isProduction = process.env.NODE_ENV === "production";
-const PROVIDER_TIMEOUT_MS = 90000;
-
-const MALA_SOMBRE_SYSTEM_INSTRUCTION = `Você é um Engenheiro Sênior de Motion Graphics e Diretor de Arte. Gere APENAS um arquivo HTML autocontido (Canvas 2D 1920x1080) 100% determinístico via window.seek(t). Sem explicações em texto.
-
-1. CONTRATO DE RENDERIZAÇÃO E ESTRUTURA (A BASE DE TUDO):
-
-Determinismo Absoluto: É PROIBIDO usar setTimeout, setInterval, requestAnimationFrame (para lógica de estado), Date.now() ou Math.random(). Use apenas matemática baseada em t. Se precisar de variação (ex: poeira), use uma função hash determinística (ex: Math.sin(seed * 12.9898) * 43758.5453).
-
-Estrutura: Toda a lógica deve estar dentro de window.seek(t). O código deve ser limpo, comentado e ter no máximo 250 linhas para evitar timeout nos modelos.
-
-Duração: Leia a timeline do roteiro e defina window.DURATION como o último timestamp + 1.5s de respiro.
-
-2. DIREÇÃO DE ARTE E LAYOUT (O PADRÃO VISUAL):
-
-Paleta: Fundo #000000, Roxo Profundo #2a0033, Violeta Luminoso #8a2be2, Branco #ffffff. Fontes: 'Bebas Neue' (títulos) e 'Oswald' (UI/Subtítulos).
-
-Centralização e Alinhamento: O centro da tela é X=960, Y=540. Se o roteiro pedir "no centro", use essas coordenadas ou ctx.translate(960, 540). NUNCA desenhe no (0,0) por acidente. Use ctx.textAlign = 'center' e ctx.textBaseline = 'middle'.
-
-Anti-Vazamento (Layout Seguro): Calcule o tamanho dos textos com ctx.measureText. Nenhum texto ou elemento pode vazar de caixas, painéis ou das bordas da tela (0 a 1920). Nada pode se sobrepor de forma que prejudique a leitura.
-
-3. FÍSICA DE MOVIMENTO E CONTINUIDADE (O FIM DO AMADORISMO):
-
-Movimento Contínuo: É PROIBIDO usar blocos de if isolados para mover objetos (ex: if (t>2 && t<5) x=100; if (t>5) x=500). Calcule uma variável de progresso geral (prog = (t - start) / duration) e use-a matematicamente em todos os frames para mover o objeto de A a B suavemente.
-
-Molas (Springs): Para entradas e transições de elementos, NUNCA use fades ou ease-in-out simples. Use a fórmula de mola amortecida: 1 - Math.exp(-damping * t) * Math.cos(freq * t).
-
-Câmera Parallax: Se o roteiro pedir movimento de câmera (pan/zoom), use ctx.scale e ctx.translate. Crie profundidade movendo as camadas de fundo mais lentamente que as camadas da frente, usando tempos de deslocamento diferentes.
-
-4. COMPONENTES VISUAIS E OTIMIZAÇÃO (ANTI-TIMEOUT):
-
-Abstração Obrigatória: NUNCA tente desenhar pessoas, animais, carros ou cenários realistas. Use formas geométricas, ícones HUD, silhuetas chapadas ou linhas de radar para representar qualquer elemento.
-
-Partículas e Atmosfera: Use um único loop for com no máximo 30 partículas determinísticas. Para névoa e luz (God Rays), use ctx.createLinearGradient e ctx.createRadialGradient com globalCompositeOperation = 'screen'.
-
-Desenho Progressivo de Formas: Se o roteiro pedir uma "linha que se desenha" ou um "círculo que cresce", use a matemática de traçado (ctx.setLineDash com offset ou arcos parciais) para revelar a forma suavemente, em vez de ela aparecer pronta.
-
-5. LEITURA CRONOMETRADA DO ROTEIRO:
-
-Respeite os tempos exatos do [AÇÃO CRONOMETRADA]. Se o roteiro diz que um texto sai aos 5s, ele deve desaparecer aos 5s.
-
-Se o roteiro pedir um "glitch", "shake" ou "impacto", use funções de ruído matemático (como Math.sin(t * 100)) para criar a vibração exata no momento pedido.
-
-6. O LOOP DE CRÍTICA (AUTO-AVALIAÇÃO OBRIGATÓRIA):
-Antes de gerar o código HTML final, faça uma checagem mental rigorosa:
-
-O código tem menos de 250 linhas e sem Math.random?
-
-Os textos e elementos estão centralizados e sem vazar das bordas?
-
-O movimento é contínuo e usa física de molas?
-
-O layout está limpo, legível e dentro do padrão de cores MALA.SOMBRE?
-Se qualquer resposta for "NÃO", reescreva o código mentalmente antes de enviar.
-
-7. [REGRA DE ÁREA SEGURA E ALINHAMENTO UNIVERSAL (ANTI-CORTE)]
-
-Definição da Área Segura: O Canvas tem dimensões fixas de 1920x1080. É PROIBIDO desenhar elementos principais (textos, formas, trajetórias, ícones) nas extremidades. Considere uma margem de segurança obrigatória de 200 pixels em todos os lados:
-- Limite de X permitido para elementos principais: 200 a 1720.
-- Limite de Y permitido para elementos principais: 200 a 880.
-
-Movimento e Trajetórias: Se um objeto se mover de um ponto A para um ponto B, as coordenadas de A e B DEVEM estar dentro da área segura (ex: X: 300 a X: 1600). NUNCA use as bordas extremas (0 ou 1920) como ponto de partida ou chegada, a menos que o roteiro exija explicitamente que o elemento saia da tela.
-
-Centralização de Textos: Use ctx.textAlign = 'center' e ctx.textBaseline = 'middle' para centralizar. Se o roteiro pedir um texto no canto, calcule a posição baseada no tamanho do texto (ctx.measureText) para garantir que ele não vaze para fora dos limites da tela (0 a 1920).
-
-Verificação de Contexto: Sempre que usar ctx.translate(x, y), certifique-se de que x e y estão dentro da área segura. Se estiver usando ctx.scale, o centro da escala deve ser o centro da tela (960, 540) para evitar que os elementos sejam empurrados para fora.
-
-Regra do "Loop de Crítica": Antes de enviar o código, faça uma checagem mental: "Se eu desenhar uma caixa delimitadora ao redor dos elementos principais deste frame, ela está totalmente contida dentro dos limites de 200 a 1720 (X) e 200 a 880 (Y)?" Se a resposta for 'não', ajuste as coordenadas.`;
-
-function hasConfiguredApiKey(value: string | undefined): value is string {
-  if (!value) return false;
-  const trimmed = value.trim();
-  if (!trimmed) return false;
-  if (trimmed.startsWith("MY_") || trimmed === "YOUR_API_KEY") return false;
-  return true;
-}
 
 /**
- * Parses timestamps in the script on the backend so we can provide an accurate fallback
- * duration (last timestamp + 1.5s) if a model declares DURATION inside a closed scope.
- */
-function inferDurationFromScript(script: string): number | null {
-  let maxSeconds = 0;
-
-  const colonRegex = /\b(\d{1,2}):(\d{2})(?:[.,](\d{1,2}))?\b/g;
-  let match: RegExpExecArray | null;
-  while ((match = colonRegex.exec(script)) !== null) {
-    const mins = parseInt(match[1], 10);
-    const secs = parseInt(match[2], 10);
-    const frac = match[3] ? parseFloat(`0.${match[3]}`) : 0;
-    if (secs < 60) {
-      const total = mins * 60 + secs + frac;
-      if (total > maxSeconds && total <= 600) {
-        maxSeconds = total;
-      }
-    }
-  }
-
-  const secondsRegex =
-    /(?:^|[^\d:])(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:s|seg|segs|segundo|segundos)\b/gi;
-  while ((match = secondsRegex.exec(script)) !== null) {
-    const val = parseFloat(match[1].replace(",", "."));
-    if (Number.isFinite(val) && val > maxSeconds && val <= 600) {
-      maxSeconds = val;
-    }
-  }
-
-  const rangeRegex =
-    /\b(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:-|–|—|até|a)\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:s|seg|segundos)?\b/gi;
-  while ((match = rangeRegex.exec(script)) !== null) {
-    const endVal = parseFloat(match[2].replace(",", "."));
-    const startVal = parseFloat(match[1].replace(",", "."));
-    if (
-      Number.isFinite(startVal) &&
-      Number.isFinite(endVal) &&
-      endVal >= startVal &&
-      endVal <= 600 &&
-      endVal > maxSeconds
-    ) {
-      maxSeconds = endVal;
-    }
-  }
-
-  if (maxSeconds > 0) {
-    return Number((maxSeconds + 1.5).toFixed(2));
-  }
-
-  return null;
-}
-
-/**
- * Inspects generated HTML code to extract any declared DURATION constant if present in local scope.
+ * Inspeciona o HTML gerado para extrair constante DURATION declarada localmente ou em window.
  */
 function inferDurationFromHtmlCode(html: string): number | null {
   const durationRegex =
@@ -154,288 +50,11 @@ function inferDurationFromHtmlCode(html: string): number | null {
   return null;
 }
 
-function extractCleanHtml(rawText: string): string {
-  // Strip reasoning blocks (<think>...</think>) emitted by reasoning models such as DeepSeek-R1
-  let cleaned = rawText.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
-
-  // If a fenced ```html ... ``` block exists, prefer its inner content
-  const fencedMatch = cleaned.match(/```(?:html|HTML)\s*\n([\s\S]*?)```/);
-  if (fencedMatch && fencedMatch[1]) {
-    cleaned = fencedMatch[1].trim();
-  } else {
-    cleaned = cleaned.replace(/^```(?:html|HTML)?\s*\n?/i, "");
-    cleaned = cleaned.replace(/\n?```\s*$/i, "");
-  }
-
-  const doctypeIndex = cleaned.search(/<!doctype\s+html>/i);
-  const htmlTagIndex = cleaned.search(/<html[\s>]/i);
-  const startIndex =
-    doctypeIndex !== -1 ? doctypeIndex : htmlTagIndex !== -1 ? htmlTagIndex : 0;
-
-  const lowerCleaned = cleaned.toLowerCase();
-  const lastCloseHtml = lowerCleaned.lastIndexOf("</html>");
-  if (lastCloseHtml !== -1 && lastCloseHtml >= startIndex) {
-    cleaned = cleaned.slice(startIndex, lastCloseHtml + "</html>".length);
-  } else if (startIndex > 0) {
-    cleaned = cleaned.slice(startIndex);
-  }
-
-  return cleaned.trim();
-}
-
-function isValidMotionHtml(html: string): boolean {
-  if (!html || html.length < 80) return false;
-  const hasDocumentOrCanvas =
-    /<html[\s>]/i.test(html) ||
-    /<!doctype\s+html>/i.test(html) ||
-    /<canvas[\s>]/i.test(html);
-  const hasScript = /<script[\s>]/i.test(html);
-  return hasDocumentOrCanvas && hasScript;
-}
-
-function createGeminiClient(apiKey: string): GoogleGenAI {
-  return new GoogleGenAI({
-    apiKey: apiKey.trim(),
-    httpOptions: {
-      headers: {
-        "User-Agent": "aistudio-build",
-      },
-    },
-  });
-}
-
-function refreshEnvFromDotenvFile(): void {
-  try {
-    const envPath = path.join(process.cwd(), ".env");
-    if (!fs.existsSync(envPath)) return;
-    const parsed = dotenv.parse(fs.readFileSync(envPath, "utf8"));
-    for (const [key, val] of Object.entries(parsed)) {
-      if (hasConfiguredApiKey(val)) {
-        process.env[key] = val.trim();
-      }
-    }
-  } catch {
-    // Ignora falhas de leitura do .env e mantém process.env atual
-  }
-}
-
-async function generateWithGeminiModel(
-  apiKey: string,
-  model: string,
-  systemInstruction: string,
-  userPrompt: string
-): Promise<string> {
-  const ai = createGeminiClient(apiKey);
-  const response = await ai.models.generateContent({
-    model,
-    contents: userPrompt,
-    config: {
-      systemInstruction,
-      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-      abortSignal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
-    },
-  });
-  return response.text ?? "";
-}
-
-interface SingleModelChatOptions {
-  endpoint: string;
-  apiKey: string;
-  model: string;
-  providerLabel: string;
-  systemInstruction: string;
-  userPrompt: string;
-  extraHeaders?: Record<string, string>;
-}
-
-interface OpenAIChatCompletionResponse {
-  model?: string;
-  choices?: Array<{
-    message?: {
-      content?: string | null;
-    };
-  }>;
-  error?: {
-    message?: string;
-  };
-}
-
-const OPENROUTER_FREE_ROUTER_MODEL = "openrouter/free";
-const NVIDIA_NIM_REINFORCEMENT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b";
-
-async function generateWithSingleOpenAICompatibleModel(
-  options: SingleModelChatOptions
-): Promise<string> {
-  const {
-    endpoint,
-    apiKey,
-    model,
-    providerLabel,
-    systemInstruction,
-    userPrompt,
-    extraHeaders,
-  } = options;
-
-  const payload = {
-    model,
-    stream: false,
-    messages: [
-      { role: "system", content: systemInstruction },
-      { role: "user", content: userPrompt },
-    ],
-  };
-
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey.trim()}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      ...(extraHeaders ?? {}),
-    },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
-  });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => "");
-    throw new Error(
-      `${providerLabel} HTTP ${response.status}: ${errText.slice(0, 240)}`
-    );
-  }
-
-  const data = (await response.json()) as OpenAIChatCompletionResponse;
-  if (data.error?.message) {
-    throw new Error(`${providerLabel} API Error: ${data.error.message}`);
-  }
-
-  const content = data.choices?.[0]?.message?.content;
-  if (!content || typeof content !== "string") {
-    throw new Error(`${providerLabel} retornou resposta vazia.`);
-  }
-
-  return content;
-}
-
 /**
- * Executa a cascata com timeout de 90s por etapa:
- * 1º (Prioridade Principal - Google Gemini): "gemini-3.8-flash" usando GEMINI_API_KEY2 (fallback GEMINI_API_KEY)
- * 2º (1ª Reserva - OpenRouter Free Router): "openrouter/free" via OPENROUTER_API_KEY
- * 3º (2ª Reserva - NVIDIA NIM): "nvidia/nemotron-3-ultra-550b-a55b" via NVIDIA_API_KEY
+ * Injeta JSZip via CDN, normalização dinâmica de window.DURATION, reprodução standalone
+ * e o módulo autocontido "Baixar Frames" (60 FPS PNG .zip) compatível com Canvas 2D, SVG, HTML/CSS e Híbrido.
  */
-async function generateMotionHtmlWithCascade(userPrompt: string): Promise<string> {
-  refreshEnvFromDotenvFile();
-  const failureLogs: string[] = [];
-
-  // 1. Prioridade Principal (Tentativa 1): Gemini 3.8 Flash usando GEMINI_API_KEY2 (90s timeout)
-  const geminiKey =
-    (hasConfiguredApiKey(process.env.GEMINI_API_KEY2)
-      ? process.env.GEMINI_API_KEY2
-      : undefined) || process.env.GEMINI_API_KEY;
-
-  if (hasConfiguredApiKey(geminiKey)) {
-    try {
-      const raw = await generateWithGeminiModel(
-        geminiKey,
-        "gemini-3.8-flash",
-        MALA_SOMBRE_SYSTEM_INSTRUCTION,
-        userPrompt
-      );
-      const html = extractCleanHtml(raw);
-      if (!isValidMotionHtml(html)) {
-        throw new Error("HTML retornado pelo Gemini 3.8 Flash é incompleto ou inválido.");
-      }
-      return html;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(
-        "[Prioridade 1 - Gemini] Gemini 3.8 Flash falhou/timeout (pulando para OpenRouter Free):",
-        msg
-      );
-      failureLogs.push(`Gemini 3.8 Flash: ${msg}`);
-    }
-  } else {
-    console.warn(
-      "[Prioridade 1 - Gemini] Pulando Gemini 3.8 Flash: GEMINI_API_KEY2 / GEMINI_API_KEY não configurada."
-    );
-  }
-
-  // 2. 1ª Reserva (Tentativa 2): Roteador Automático Gratuito do OpenRouter ("openrouter/free", 90s timeout)
-  if (hasConfiguredApiKey(process.env.OPENROUTER_API_KEY)) {
-    try {
-      const raw = await generateWithSingleOpenAICompatibleModel({
-        endpoint: "https://openrouter.ai/api/v1/chat/completions",
-        apiKey: process.env.OPENROUTER_API_KEY,
-        model: OPENROUTER_FREE_ROUTER_MODEL,
-        providerLabel: "OpenRouter Free Router",
-        systemInstruction: MALA_SOMBRE_SYSTEM_INSTRUCTION,
-        userPrompt,
-        extraHeaders: {
-          "HTTP-Referer": process.env.APP_URL || "http://localhost:3000",
-          "X-Title": "Mala.Sombre Motion Studio",
-        },
-      });
-      const html = extractCleanHtml(raw);
-      if (!isValidMotionHtml(html)) {
-        throw new Error("HTML retornado pelo OpenRouter Free Router é incompleto ou inválido.");
-      }
-      return html;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(
-        `[Reserva 2 - OpenRouter] ${OPENROUTER_FREE_ROUTER_MODEL} falhou/timeout (pulando para NVIDIA):`,
-        msg
-      );
-      failureLogs.push(`OpenRouter (${OPENROUTER_FREE_ROUTER_MODEL}): ${msg}`);
-    }
-  } else {
-    console.warn(
-      "[Reserva 2 - OpenRouter] Pulando OpenRouter: OPENROUTER_API_KEY não configurada."
-    );
-  }
-
-  // 3. 2ª Reserva (Tentativa 3): NVIDIA NIM direto (nvidia/nemotron-3-ultra-550b-a55b, 90s timeout)
-  if (hasConfiguredApiKey(process.env.NVIDIA_API_KEY)) {
-    try {
-      const raw = await generateWithSingleOpenAICompatibleModel({
-        endpoint: "https://integrate.api.nvidia.com/v1/chat/completions",
-        apiKey: process.env.NVIDIA_API_KEY,
-        model: NVIDIA_NIM_REINFORCEMENT_MODEL,
-        providerLabel: "NVIDIA NIM",
-        systemInstruction: MALA_SOMBRE_SYSTEM_INSTRUCTION,
-        userPrompt,
-      });
-      const html = extractCleanHtml(raw);
-      if (!isValidMotionHtml(html)) {
-        throw new Error("HTML retornado pela NVIDIA NIM é incompleto ou inválido.");
-      }
-      return html;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(
-        `[Reserva 3 - NVIDIA] ${NVIDIA_NIM_REINFORCEMENT_MODEL} falhou/timeout:`,
-        msg
-      );
-      failureLogs.push(`NVIDIA NIM (${NVIDIA_NIM_REINFORCEMENT_MODEL}): ${msg}`);
-    }
-  } else {
-    console.warn(
-      "[Reserva 3 - NVIDIA] Pulando NVIDIA NIM direto: NVIDIA_API_KEY não configurada."
-    );
-  }
-
-  console.error(
-    "[Cascade Fallback] Todos os provedores falharam ou estavam indisponíveis:",
-    failureLogs
-  );
-  throw new Error("ALL_PROVIDERS_FAILED");
-}
-
-/**
- * Embeds JSZip via CDN, dynamic window.DURATION normalization, standalone playback runner,
- * and a self-contained "Baixar Frames" button into the generated HTML.
- */
-function injectFrameExporter(
+export function injectFrameExporter(
   cleanHtml: string,
   scriptEstimatedDuration: number | null
 ): string {
@@ -568,7 +187,6 @@ function injectFrameExporter(
     return fb;
   }
 
-  // Ensure window.DURATION is exposed immediately and drive standalone playback if opened outside Studio
   function initStandaloneAndDuration() {
     var dur = resolveDuration();
     var seekFn = resolveSeekFn();
@@ -615,6 +233,80 @@ function injectFrameExporter(
     });
   }
 
+  function drawSvgStringToCtx(svgMarkup, ctx, w, h) {
+    return new Promise(function(resolve) {
+      var svgBlob = new Blob([svgMarkup], { type: 'image/svg+xml;charset=utf-8' });
+      var url = URL.createObjectURL(svgBlob);
+      var img = new Image();
+      img.onload = function() {
+        try {
+          ctx.drawImage(img, 0, 0, w, h);
+        } catch (_err) {}
+        URL.revokeObjectURL(url);
+        resolve(true);
+      };
+      img.onerror = function() {
+        URL.revokeObjectURL(url);
+        resolve(false);
+      };
+      img.src = url;
+    });
+  }
+
+  function serializeStageSvg(svgEl, w, h) {
+    var clone = svgEl.cloneNode(true);
+    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    if (!clone.getAttribute('viewBox')) {
+      clone.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+    }
+    clone.setAttribute('width', String(w));
+    clone.setAttribute('height', String(h));
+    return new XMLSerializer().serializeToString(clone);
+  }
+
+  function copyComputedStylesDeep(srcNode, dstNode) {
+    if (srcNode.nodeType !== 1 || dstNode.nodeType !== 1) return;
+    var cs = window.getComputedStyle(srcNode);
+    var cssText = '';
+    for (var i = 0; i < cs.length; i++) {
+      var prop = cs[i];
+      var val = cs.getPropertyValue(prop);
+      if (val && val.indexOf('url("http') === -1 && val.indexOf("url('http") === -1) {
+        cssText += prop + ':' + val + ';';
+      }
+    }
+    dstNode.setAttribute('style', cssText);
+    var srcChildren = srcNode.children;
+    var dstChildren = dstNode.children;
+    for (var j = 0; j < srcChildren.length && j < dstChildren.length; j++) {
+      copyComputedStylesDeep(srcChildren[j], dstChildren[j]);
+    }
+  }
+
+  function serializeDomStageToSvg(w, h) {
+    var rootCandidate = document.getElementById('stage') || document.body;
+    var clone = rootCandidate.cloneNode(true);
+    copyComputedStylesDeep(rootCandidate, clone);
+    var btnClone = clone.querySelector ? clone.querySelector('#ms-download-frames-btn') : null;
+    if (btnClone && btnClone.parentNode) {
+      btnClone.parentNode.removeChild(btnClone);
+    }
+    var scripts = clone.querySelectorAll ? clone.querySelectorAll('script, link') : [];
+    for (var k = 0; k < scripts.length; k++) {
+      if (scripts[k].parentNode) scripts[k].parentNode.removeChild(scripts[k]);
+    }
+    clone.style.transform = 'none';
+    clone.style.width = w + 'px';
+    clone.style.height = h + 'px';
+    clone.style.margin = '0';
+    var xhtml = new XMLSerializer().serializeToString(clone);
+    var bg = window.getComputedStyle(document.body).backgroundColor || '#000000';
+    return '<svg xmlns="http://www.w3.org/2000/svg" width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '">' +
+      '<rect width="100%" height="100%" fill="' + bg + '"/>' +
+      '<foreignObject width="100%" height="100%">' + xhtml + '</foreignObject>' +
+      '</svg>';
+  }
+
   async function exportAllFrames() {
     if (isExporting) return;
 
@@ -629,34 +321,39 @@ function injectFrameExporter(
       return;
     }
 
-    var allCanvases = Array.prototype.slice.call(document.querySelectorAll('canvas'));
     var seekFn = resolveSeekFn();
-
-    if (allCanvases.length === 0 || !seekFn) {
-      labelEl.textContent = 'Canvas/seek(t) ausente';
+    if (!seekFn) {
+      labelEl.textContent = 'seek(t) ausente';
       notifyParent({
         type: 'MALASOMBRE_EXPORT_STATUS',
         active: false,
-        error: 'Elemento Canvas ou função window.seek(t) não encontrados na cena.'
+        error: 'Função determinística window.seek(t) não encontrada na cena.'
       });
       setTimeout(function() { labelEl.textContent = 'Baixar Frames'; }, 3000);
       return;
     }
 
+    var allCanvases = Array.prototype.slice.call(document.querySelectorAll('canvas'));
+    var allSvgs = Array.prototype.slice.call(document.querySelectorAll('svg')).filter(function(el) {
+      return !btn.contains(el);
+    });
+
     allCanvases.sort(function(a, b) {
-      var za = parseInt(window.getComputedStyle(a).zIndex, 10);
-      var zb = parseInt(window.getComputedStyle(b).zIndex, 10);
-      if (isNaN(za)) za = 0;
-      if (isNaN(zb)) zb = 0;
+      var za = parseInt(window.getComputedStyle(a).zIndex, 10) || 0;
+      var zb = parseInt(window.getComputedStyle(b).zIndex, 10) || 0;
       return za - zb;
     });
 
+    var frameW = (allCanvases[0] && allCanvases[0].width) || 1920;
+    var frameH = (allCanvases[0] && allCanvases[0].height) || 1080;
+    var needsComposite = allCanvases.length !== 1 || allSvgs.length > 0;
+
     var compositeCanvas = null;
     var compositeCtx = null;
-    if (allCanvases.length > 1) {
+    if (needsComposite) {
       compositeCanvas = document.createElement('canvas');
-      compositeCanvas.width = allCanvases[0].width || 1920;
-      compositeCanvas.height = allCanvases[0].height || 1080;
+      compositeCanvas.width = frameW;
+      compositeCanvas.height = frameH;
       compositeCtx = compositeCanvas.getContext('2d');
     }
 
@@ -682,11 +379,29 @@ function injectFrameExporter(
 
         var targetCanvas = allCanvases[0];
         if (compositeCanvas && compositeCtx) {
-          compositeCtx.clearRect(0, 0, compositeCanvas.width, compositeCanvas.height);
-          for (var cIdx = 0; cIdx < allCanvases.length; cIdx++) {
-            var layer = allCanvases[cIdx];
-            if (layer.width > 0 && layer.height > 0 && window.getComputedStyle(layer).display !== 'none') {
-              compositeCtx.drawImage(layer, 0, 0, compositeCanvas.width, compositeCanvas.height);
+          var bodyBg = window.getComputedStyle(document.body).backgroundColor;
+          compositeCtx.clearRect(0, 0, frameW, frameH);
+          if (bodyBg && bodyBg !== 'rgba(0, 0, 0, 0)' && bodyBg !== 'transparent') {
+            compositeCtx.fillStyle = bodyBg;
+            compositeCtx.fillRect(0, 0, frameW, frameH);
+          }
+
+          if (allCanvases.length === 0 && allSvgs.length === 0) {
+            var domSvg = serializeDomStageToSvg(frameW, frameH);
+            await drawSvgStringToCtx(domSvg, compositeCtx, frameW, frameH);
+          } else {
+            for (var cIdx = 0; cIdx < allCanvases.length; cIdx++) {
+              var layer = allCanvases[cIdx];
+              if (layer.width > 0 && layer.height > 0 && window.getComputedStyle(layer).display !== 'none') {
+                compositeCtx.drawImage(layer, 0, 0, frameW, frameH);
+              }
+            }
+            for (var sIdx = 0; sIdx < allSvgs.length; sIdx++) {
+              var svgLayer = allSvgs[sIdx];
+              if (window.getComputedStyle(svgLayer).display !== 'none') {
+                var svgStr = serializeStageSvg(svgLayer, frameW, frameH);
+                await drawSvgStringToCtx(svgStr, compositeCtx, frameW, frameH);
+              }
             }
           }
           targetCanvas = compositeCanvas;
@@ -815,6 +530,7 @@ async function startServer() {
   }
   app.use(express.static(publicDir));
 
+  // Gerenciamento de logotipo existente preservado integralmente
   app.post("/api/logo", (req: Request, res: Response) => {
     try {
       const { dataUrl } = req.body as { dataUrl?: string };
@@ -848,52 +564,285 @@ async function startServer() {
     }
   });
 
-  // Main motion graphic generation endpoint with 5-tier Cascade Fallback and Dynamic Duration
-  app.post("/api/generate", async (req: Request, res: Response) => {
-    req.setTimeout(360_000);
-    res.setTimeout(360_000);
+  // Catálogo dos 30 Estilos Especializados
+  app.get("/api/styles", (_req: Request, res: Response) => {
+    res.json({
+      categories: STYLE_CATEGORIES,
+      styles: MOTION_STYLE_LIBRARY,
+    });
+  });
+
+  // Diagnóstico seguro de conectividade e configuração dos provedores (nunca expõe chaves/segredos)
+  app.get("/api/providers/health", async (req: Request, res: Response) => {
     try {
-      const { script } = req.body as { script?: string };
-
-      if (!script || typeof script !== "string" || !script.trim()) {
-        res.status(400).json({
-          error: "Por favor, insira um roteiro antes de gerar a animação.",
-        });
-        return;
-      }
-
-      const trimmedScript = script.trim();
-      const scriptDurationHint = inferDurationFromScript(trimmedScript);
-
-      const durationHintLine =
-        scriptDurationHint !== null
-          ? `\nOBSERVAÇÃO DE DURAÇÃO DETECTADA: O último timestamp identificado no roteiro aponta para uma duração total recomendada de aproximadamente ${scriptDurationHint}s (último timestamp + 1.5s de respiro). Defina window.DURATION dinamicamente de acordo com o fim real do roteiro + 1.5s.`
-          : `\nOBSERVAÇÃO DE DURAÇÃO DINÂMICA: Calcule e defina window.DURATION dinamicamente com base no último timestamp do roteiro + 1.5s de respiro (nunca fixe em 12s).`;
-
-      const userPrompt = `ROTEIRO PARA ANIMAR (Design System Universal MALA.SOMBRE — Canvas 2D 1920x1080 100% determinístico via window.seek(t), no máximo 250 linhas totais):
-"""
-${trimmedScript}
-"""
-${durationHintLine}
-
-Gere o arquivo HTML autocontido, limpo e comentado agora (no máximo 250 linhas totais). Retorne APENAS o código HTML.`;
-
-      const cleanHtml = await generateMotionHtmlWithCascade(userPrompt);
-      const htmlWithFrameExporter = injectFrameExporter(
-        cleanHtml,
-        scriptDurationHint
-      );
-
-      res.json({ html: htmlWithFrameExporter });
-    } catch (_error: unknown) {
-      res.status(503).json({
-        error:
-          "Não foi possível gerar o motion graphic no momento pois todos os provedores de IA estão temporariamente indisponíveis. Aguarde alguns instantes e tente novamente.",
+      const probe = req.query.probe === "true" || req.query.probe === "1";
+      const providers = await diagnoseProvidersHealth(probe);
+      res.json({
+        ok: true,
+        probed: probe,
+        checkedAt: new Date().toISOString(),
+        providers,
       });
+    } catch (error) {
+      const msg =
+        error instanceof Error
+          ? sanitizeDiagnosticText(error.message)
+          : "Falha ao diagnosticar provedores.";
+      res.status(500).json({ ok: false, error: msg });
     }
   });
 
-  // Catch-all for unmatched /api/* routes and middleware errors so /api never returns HTML
+  function isLoopbackRequest(req: Request): boolean {
+    const ip = req.ip || req.socket.remoteAddress || "";
+    return (
+      ip === "127.0.0.1" ||
+      ip === "::1" ||
+      ip === "::ffff:127.0.0.1" ||
+      req.hostname === "localhost"
+    );
+  }
+
+  function createRequestCascadeContext(
+    req: Request,
+    res: Response
+  ): { context: CascadeRunContext; cleanup: () => void } {
+    const clientAbortController = new AbortController();
+
+    const onDisconnect = () => {
+      if (!res.writableEnded && !clientAbortController.signal.aborted) {
+        clientAbortController.abort(new Error("CLIENT_DISCONNECTED"));
+      }
+    };
+
+    req.on("aborted", onDisconnect);
+    res.on("close", onDisconnect);
+
+    let simulationFaults: CascadeSimulationMap | undefined;
+    if (!isProduction && isLoopbackRequest(req)) {
+      const rawSimHeader = req.header("x-ms-test-faults");
+      if (rawSimHeader) {
+        try {
+          simulationFaults = JSON.parse(rawSimHeader) as CascadeSimulationMap;
+        } catch {
+          simulationFaults = undefined;
+        }
+      }
+    }
+
+    const cleanup = () => {
+      req.off("aborted", onDisconnect);
+      res.off("close", onDisconnect);
+    };
+
+    return {
+      context: {
+        clientSignal: clientAbortController.signal,
+        simulationFaults,
+      },
+      cleanup,
+    };
+  }
+
+  function sendStructuredApiError(res: Response, error: unknown): void {
+    if (res.headersSent || res.writableEnded) {
+      return;
+    }
+
+    if (error instanceof CascadeExecutionError) {
+      res.status(error.statusCode).json(error.toApiErrorPayload());
+      return;
+    }
+
+    const safeReason =
+      error instanceof Error
+        ? sanitizeDiagnosticText(error.message)
+        : "Erro interno ao processar a solicitação.";
+
+    const payload: ApiErrorPayload = {
+      error: safeReason || "Não foi possível concluir a operação solicitada.",
+      errorType: "provider_unavailable",
+      retryable: true,
+    };
+    res.status(500).json(payload);
+  }
+
+  // MODO A — Endpoint principal compatível de Geração Direta com Direção Criativa Autônoma
+  app.post("/api/generate", async (req: Request, res: Response) => {
+    req.setTimeout(240_000);
+    res.setTimeout(240_000);
+    const { context, cleanup } = createRequestCascadeContext(req, res);
+    try {
+      const body = req.body as Partial<DirectGenerateRequest>;
+      const script = body?.script;
+
+      if (!script || typeof script !== "string" || !script.trim()) {
+        const errPayload: ApiErrorPayload = {
+          error: "Por favor, insira um roteiro antes de gerar a animação.",
+          errorType: "validation_error",
+          retryable: false,
+        };
+        res.status(400).json(errPayload);
+        return;
+      }
+
+      const result = await generateDirectMotionWithAI(
+        {
+          script: script.trim(),
+          preferredStyleId: body.preferredStyleId,
+          creativeNotes: body.creativeNotes,
+        },
+        context
+      );
+
+      const htmlWithFrameExporter = injectFrameExporter(
+        result.html,
+        result.estimatedDuration
+      );
+
+      if (!res.writableEnded) {
+        res.json({
+          html: htmlWithFrameExporter,
+          meta: {
+            estimatedDuration: result.estimatedDuration,
+            selectedStyleIds: result.selectedStyleIds,
+            renderTechnology: result.renderTechnology,
+            diagnostics: result.diagnostics,
+          },
+        });
+      }
+    } catch (error: unknown) {
+      sendStructuredApiError(res, error);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // MODO B (Etapa 1) — Planejamento de Direção de Arte e Storyboard estruturado
+  app.post("/api/storyboard/plan", async (req: Request, res: Response) => {
+    req.setTimeout(240_000);
+    res.setTimeout(240_000);
+    const { context, cleanup } = createRequestCascadeContext(req, res);
+    try {
+      const body = req.body as Partial<PlanStoryboardRequest>;
+      if (!body.script || typeof body.script !== "string" || !body.script.trim()) {
+        const errPayload: ApiErrorPayload = {
+          error: "Insira um roteiro válido para planejar o storyboard.",
+          errorType: "validation_error",
+          retryable: false,
+        };
+        res.status(400).json(errPayload);
+        return;
+      }
+
+      const result = await planStoryboardWithAI(
+        {
+          script: body.script.trim(),
+          preferredStyleId: body.preferredStyleId,
+          creativeNotes: body.creativeNotes,
+        },
+        context
+      );
+
+      if (!res.writableEnded) {
+        res.json({
+          project: result.project,
+          diagnostics: result.diagnostics,
+        });
+      }
+    } catch (error: unknown) {
+      sendStructuredApiError(res, error);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // MODO B (Etapa 2 opcional) — Regeneração individual de uma cena preservando memória e vizinhança
+  app.post(
+    "/api/storyboard/regenerate-scene",
+    async (req: Request, res: Response) => {
+      req.setTimeout(240_000);
+      res.setTimeout(240_000);
+      const { context, cleanup } = createRequestCascadeContext(req, res);
+      try {
+        const body = req.body as Partial<RegenerateSceneRequest>;
+        if (
+          !body.project ||
+          !Array.isArray(body.project.scenes) ||
+          !body.sceneId ||
+          typeof body.sceneId !== "string"
+        ) {
+          const errPayload: ApiErrorPayload = {
+            error:
+              "Projeto ou identificador estável da cena ausente para regeneração.",
+            errorType: "validation_error",
+            retryable: false,
+          };
+          res.status(400).json(errPayload);
+          return;
+        }
+
+        const outcome = await regenerateSceneWithAI(
+          {
+            project: body.project as ProjectContextMemory,
+            sceneId: body.sceneId,
+            instruction: body.instruction,
+            requestedStyleId: body.requestedStyleId,
+          },
+          context
+        );
+
+        if (!res.writableEnded) {
+          res.json(outcome);
+        }
+      } catch (error: unknown) {
+        sendStructuredApiError(res, error);
+      } finally {
+        cleanup();
+      }
+    }
+  );
+
+  // MODO B (Etapa 3) — Renderização Final a partir do Storyboard e Memória do Projeto aprovados
+  app.post("/api/storyboard/render", async (req: Request, res: Response) => {
+    req.setTimeout(240_000);
+    res.setTimeout(240_000);
+    const { context, cleanup } = createRequestCascadeContext(req, res);
+    try {
+      const body = req.body as Partial<RenderStoryboardRequest>;
+      const project = body.project;
+
+      if (!project || !Array.isArray(project.scenes) || project.scenes.length === 0) {
+        const errPayload: ApiErrorPayload = {
+          error:
+            "Envie o storyboard válido com ao menos uma cena para gerar a animação.",
+          errorType: "validation_error",
+          retryable: false,
+        };
+        res.status(400).json(errPayload);
+        return;
+      }
+
+      const rendered = await renderApprovedStoryboardWithAI(project, context);
+      const htmlWithFrameExporter = injectFrameExporter(
+        rendered.html,
+        rendered.totalDuration
+      );
+
+      if (!res.writableEnded) {
+        res.json({
+          html: htmlWithFrameExporter,
+          totalDuration: rendered.totalDuration,
+          diagnostics: rendered.diagnostics,
+        });
+      }
+    } catch (error: unknown) {
+      sendStructuredApiError(res, error);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Catch-all para rotas /api/* não encontradas (sempre retorna JSON)
   app.all("/api/*", (_req: Request, res: Response) => {
     res.status(404).json({ error: "Rota da API não encontrada." });
   });
